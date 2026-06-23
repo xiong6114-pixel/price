@@ -119,7 +119,7 @@ def get_paper_response_config(
     return cfg
 
 
-def get_paper_response_f_p30_arr50() -> Dict[str, Any]:
+def get_paper_response_F_p30_arr50_config() -> Dict[str, Any]:
     """Primary response-calibrated config selected from smoke probes."""
     cfg = get_paper_response_config(
         q_threshold=5.0,
@@ -136,24 +136,38 @@ def get_paper_response_f_p30_arr50() -> Dict[str, Any]:
     return cfg
 
 
+def get_paper_response_F_p30_arr50_eta4_config() -> Dict[str, Any]:
+    """Response-calibrated config with stronger queue penalty for training."""
+    cfg = get_paper_response_F_p30_arr50_config()
+    cfg.update({
+        "eta": 4.0,
+    })
+    return cfg
+
+
+# Backward-compatible alias for earlier helper name.
+def get_paper_response_f_p30_arr50() -> Dict[str, Any]:
+    return get_paper_response_F_p30_arr50_config()
+
+
 def iter_paper_response_grid():
     """Focused response-calibrated candidate set after smoke probes."""
     candidates = [
         (
-            "paper_response_F_p30_arr50",
-            get_paper_response_f_p30_arr50(),
+            "paper_response_F_p30_arr50_eta4",
+            get_paper_response_F_p30_arr50_eta4_config(),
         ),
         (
             "paper_response_F_p30_arr45",
             {
-                **get_paper_response_f_p30_arr50(),
+                **get_paper_response_F_p30_arr50_config(),
                 "arrival_rate": 45.0,
             },
         ),
         (
             "paper_response_F_p30_arr50_q4",
             {
-                **get_paper_response_f_p30_arr50(),
+                **get_paper_response_F_p30_arr50_config(),
                 "q_threshold": 4.0,
             },
         ),

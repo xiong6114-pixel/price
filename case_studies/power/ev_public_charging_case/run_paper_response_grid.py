@@ -22,12 +22,12 @@ from case_studies.power.ev_public_charging_case.train_rllib import (
 )
 
 
-def _write_comparison(base: Path, q_threshold: float) -> None:
+def _write_comparison(base: Path, q_threshold: float, ma_eval_dir: str, ma_label: str) -> None:
     rows = [
         load_one_baseline("FP", base / "FP_eval", q_threshold=q_threshold),
         load_one_baseline("I-TransA3C", base / "I_TransA3C_eval", q_threshold=q_threshold),
         load_one_baseline("MAPPO", base / "MAPPO_MLP_eval", q_threshold=q_threshold),
-        load_one_baseline("MA-TransA3C", base / "MA_v3_1b_30ep_eval", q_threshold=q_threshold),
+        load_one_baseline(ma_label, base / ma_eval_dir, q_threshold=q_threshold),
     ]
     write_csv(base / "paper_table2_reproduction.csv", add_relative_metrics(rows, fp_algo_name="FP"))
 
@@ -87,20 +87,37 @@ def run_one(name, cfg):
         algo="MAPPO-MLP",
     )
 
+    ma_train_kwargs = {
+        "num_episodes": 30,
+        "steps_per_episode": 96,
+        "seed": 42,
+        "gamma": 0.99,
+        "k_neighbors": 4,
+        "use_ma_station_obs": True,
+        "use_lagged_rank_loss": False,
+        "lambda_rank": 0.20,
+        "rank_margin": 0.02,
+        "rank_eps": 0.10,
+        "env_config": cfg,
+        "output_dir": str(base / "MA_v3_1b_30ep_train"),
+        "algo": "MA-TransA3C-v3.1b-30ep",
+    }
+    ma_eval_dir = "MA_v3_1b_30ep_eval"
+    ma_algo = "MA-TransA3C-v3.1b-30ep"
+
+    if name == "paper_response_F_p30_arr50_eta4":
+        ma_train_kwargs.update({
+            "use_lagged_rank_loss": True,
+            "lambda_anchor": 0.04,
+            "price_anchor": 0.46,
+            "output_dir": str(base / "MA_v6a_anchor46_eta4_train"),
+            "algo": "MA-TransA3C-v6a-anchor46-eta4",
+        })
+        ma_eval_dir = "MA_v6a_anchor46_eta4_eval"
+        ma_algo = "MA-TransA3C-v6a-anchor46-eta4"
+
     _, ma_policy, _ = train_ma_transa3c(
-        num_episodes=30,
-        steps_per_episode=96,
-        seed=42,
-        gamma=0.99,
-        k_neighbors=4,
-        use_ma_station_obs=True,
-        use_lagged_rank_loss=False,
-        lambda_rank=0.20,
-        rank_margin=0.02,
-        rank_eps=0.10,
-        env_config=cfg,
-        output_dir=str(base / "MA_v3_1b_30ep_train"),
-        algo="MA-TransA3C-v3.1b-30ep",
+        **ma_train_kwargs,
     )
     evaluate_ma_transa3c(
         ma_policy,
@@ -110,11 +127,16 @@ def run_one(name, cfg):
         k_neighbors=4,
         use_ma_station_obs=True,
         env_config=cfg,
-        output_dir=str(base / "MA_v3_1b_30ep_eval"),
-        algo="MA-TransA3C-v3.1b-30ep",
+        output_dir=str(base / ma_eval_dir),
+        algo=ma_algo,
     )
 
-    _write_comparison(base, q_threshold=float(cfg.get("q_threshold", 4.0)))
+    _write_comparison(
+        base,
+        q_threshold=float(cfg.get("q_threshold", 4.0)),
+        ma_eval_dir=ma_eval_dir,
+        ma_label=ma_algo,
+    )
 
 
 def main():
