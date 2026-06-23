@@ -355,7 +355,9 @@ class MATransA3CPolicy:
                 dtype=torch.float32,
                 device=self.device,
             )
-            anchor_loss = F.mse_loss(mean_matrix.mean(dim=1), anchor_target)
+            # Treat the anchor as a price floor so high-price steps are not pushed back down.
+            anchor_gap = F.relu(anchor_target - mean_matrix.mean(dim=1))
+            anchor_loss = anchor_gap.pow(2).mean()
 
         actor_loss = (
             actor_loss_pg
