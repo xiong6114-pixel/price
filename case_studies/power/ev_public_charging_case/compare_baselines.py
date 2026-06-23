@@ -35,7 +35,11 @@ def _to_float(row: Dict[str, str], key: str) -> float:
     return float(value) if value not in {"", None} else math.nan
 
 
-def summarize_step_metrics(step_rows: List[Dict[str, str]], algo: str) -> Dict[str, float]:
+def summarize_step_metrics(
+    step_rows: List[Dict[str, str]],
+    algo: str,
+    q_threshold: float = 4.0,
+) -> Dict[str, float]:
     required_cols = [
         "served_kwh",
         "revenue",
@@ -66,24 +70,57 @@ def summarize_step_metrics(step_rows: List[Dict[str, str]], algo: str) -> Dict[s
     utilization = [_to_float(row, "utilization") for row in step_rows]
     congestion_penalty = [_to_float(row, "congestion_penalty") for row in step_rows]
     price = [_to_float(row, "price") for row in step_rows]
+    queue_violation_flags = [1.0 if q > q_threshold else 0.0 for q in queue_len]
+    queue_excess = [max(0.0, q - q_threshold) for q in queue_len]
+    abandoned_soc = [
+        _to_float(row, "abandoned_soc") if "abandoned_soc" in row else 0.0
+        for row in step_rows
+    ]
+    abandoned_cost = [
+        _to_float(row, "abandoned_cost") if "abandoned_cost" in row else 0.0
+        for row in step_rows
+    ]
+    abandoned_full = [
+        _to_float(row, "abandoned_full") if "abandoned_full" in row else 0.0
+        for row in step_rows
+    ]
+    abandoned_timeout = [
+        _to_float(row, "abandoned_timeout") if "abandoned_timeout" in row else 0.0
+        for row in step_rows
+    ]
+    daily_divisor = max(float(episodes), 1.0)
 
     return {
         "algo": algo,
         "episodes": float(episodes),
         "steps_per_episode": float(steps),
         "stations": float(stations),
+        "avg_daily_charging_volume_kwh": sum(served_kwh) / daily_divisor,
+        "avg_daily_total_revenue_cny": sum(revenue) / daily_divisor,
+        "avg_daily_electricity_cost_cny": sum(grid_cost) / daily_divisor,
+        "avg_daily_network_profit_cny": sum(profit) / daily_divisor,
         "total_served_kwh": sum(served_kwh),
         "total_revenue": sum(revenue),
         "total_grid_cost": sum(grid_cost),
         "total_profit": sum(profit),
         "total_reward_from_steps": sum(reward),
         "total_abandoned": sum(abandoned),
+        "total_abandoned_soc": sum(abandoned_soc),
+        "total_abandoned_cost": sum(abandoned_cost),
+        "total_abandoned_full": sum(abandoned_full),
+        "total_abandoned_timeout": sum(abandoned_timeout),
         "avg_abandoned_per_step": mean(abandoned),
         "avg_queue_len": mean(queue_len),
         "max_queue_len": max(queue_len),
+        "queue_volatility": pstdev(queue_len) if len(queue_len) > 1 else 0.0,
+        "queue_violation_count": sum(queue_violation_flags),
+        "queue_excess_total": sum(queue_excess),
+        "queue_excess_mean": mean(queue_excess),
         "avg_utilization": mean(utilization),
         "max_utilization": max(utilization),
         "total_congestion_penalty": sum(congestion_penalty),
+        "paper_violation_count_proxy": sum(queue_violation_flags),
+        "paper_violation_plus_abandoned_proxy": sum(queue_violation_flags) + sum(abandoned),
         "avg_price": mean(price),
         "min_price": min(price),
         "max_price": max(price),
@@ -114,7 +151,7 @@ def summarize_episode_metrics(episode_rows: Optional[List[Dict[str, str]]], algo
     }
 
 
-def load_one_baseline(label: str, directory: Path) -> Dict[str, float]:
+def load_one_baseline(label: str, directory: Path, q_threshold: float = 4.0) -> Dict[str, float]:
     step_path = directory / "step_metrics.csv"
     episode_path = directory / "episode_metrics.csv"
 
@@ -125,7 +162,7 @@ def load_one_baseline(label: str, directory: Path) -> Dict[str, float]:
     episode_rows = read_csv_if_exists(episode_path)
     algo = infer_algo(step_rows, fallback=label)
 
-    step_summary = summarize_step_metrics(step_rows, algo)
+    step_summary = summarize_step_metrics(step_rows, algo, q_threshold=q_threshold)
     episode_summary = summarize_episode_metrics(episode_rows, algo)
     return {**step_summary, **episode_summary}
 
@@ -184,7 +221,13 @@ def print_table(rows: List[Dict[str, float]]) -> None:
         "total_profit",
         "total_reward_from_episodes",
         "total_served_kwh",
+        "avg_daily_charging_volume_kwh",
+        "avg_daily_total_revenue_cny",
+        "avg_daily_electricity_cost_cny",
+        "avg_daily_network_profit_cny",
         "total_abandoned",
+        "queue_volatility",
+        "queue_violation_count",
         "avg_queue_len",
         "avg_utilization",
         "avg_price",
@@ -219,11 +262,17 @@ def main() -> None:
         default="outputs/baseline_comparison.csv",
         help="Output comparison CSV path.",
     )
+    parser.add_argument(
+        "--q-threshold",
+        type=float,
+        default=4.0,
+        help="Queue threshold used to compute paper-style violation counts.",
+    )
     args = parser.parse_args()
 
     rows: List[Dict[str, float]] = []
     for label, directory in args.baseline:
-        row = load_one_baseline(label, Path(directory))
+        row = load_one_baseline(label, Path(directory), q_threshold=args.q_threshold)
         if not row.get("algo"):
             row["algo"] = label
         rows.append(row)

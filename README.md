@@ -1,11 +1,11 @@
 # price
 
-This repository contains the curated "key code" bundle for the EV public charging dynamic pricing project.
+This repository contains the active codebase for the EV public charging dynamic pricing project.
 
-The main code is kept under `importance/`, which preserves the paper's current mainline experiment structure and includes:
+The main code is tracked directly from the workspace source tree, including:
 
-- `importance/case_studies/power/ev_public_charging_case/`
-- `importance/heron/`
+- `case_studies/power/ev_public_charging_case/`
+- `heron/`
 
 Excluded from version control on purpose:
 
@@ -14,4 +14,4 @@ Excluded from version control on purpose:
 - experiment outputs under `outputs/`
 - large local data and reference files such as `.xlsx` and `.pdf`
 
-GitHub upload prepared from the local workspace on 2026-06-23.
+GitHub sync prepared from the local workspace on 2026-06-23.

@@ -46,6 +46,12 @@ class ChargingEnv(HeronEnv):
         self.center_sigma = float(kwargs.get("center_sigma", 0.55))
         self.edge_sigma = float(kwargs.get("edge_sigma", 0.50))
         self.generalized_cost_threshold = float(kwargs.get("generalized_cost_threshold", 60.0))
+        self.lmp_base = float(kwargs.get("lmp_base", 0.20))
+        self.lmp_amp = float(kwargs.get("lmp_amp", 0.10))
+        self.choice_lmp_weight = float(kwargs.get("choice_lmp_weight", 1.0))
+        self.charge_lmp_weight = float(kwargs.get("charge_lmp_weight", 1.0))
+        self.enable_in_session_price_response = bool(kwargs.get("enable_in_session_price_response", True))
+        self.min_charge_power_frac = float(kwargs.get("min_charge_power_frac", 0.25))
 
         self._time_s = 0.0
 
@@ -53,7 +59,12 @@ class ChargingEnv(HeronEnv):
         self._rng = np.random.default_rng(seed)
 
         # External scenarios
-        self.scenario = MarketScenario(self._arrival_rate, 3600.0)
+        self.scenario = MarketScenario(
+            self._arrival_rate,
+            3600.0,
+            lmp_base=self.lmp_base,
+            lmp_amp=self.lmp_amp,
+        )
         self.reg_scenario = RegulationScenario(reg_freq=reg_freq, alpha=reg_alpha, seed=seed or 0)
         self._latest_station_metrics: Dict[str, Dict[str, Any]] = {}
         self._latest_reg_metrics: Dict[str, Any] = {}
@@ -120,7 +131,12 @@ class ChargingEnv(HeronEnv):
     def reset(self, *, seed: Optional[int] = None, **kwargs) -> Tuple[MultiAgentDict, MultiAgentDict]:
         """Reset environment state for a new episode."""
 
-        self.scenario = MarketScenario(self._arrival_rate, 3600.0)
+        self.scenario = MarketScenario(
+            self._arrival_rate,
+            3600.0,
+            lmp_base=self.lmp_base,
+            lmp_amp=self.lmp_amp,
+        )
         # reset regulation scenario clock too
         self.reg_scenario = RegulationScenario(
             reg_freq=self.reg_scenario.reg_freq,
@@ -329,13 +345,13 @@ class ChargingEnv(HeronEnv):
                 continue
 
             service_fee = float(env_state.station_prices.get(station_id, 0.25))
-            retail_price = float(env_state.lmp) + service_fee
+            choice_price = service_fee + self.choice_lmp_weight * float(env_state.lmp)
             travel_time_min = 60.0 * dist_km / max(self.travel_speed_kmph, 1e-6)
             wait_time_min = self._estimate_wait_min(env_state, station_id)
             generalized_cost = (
                 self.omega_travel * travel_time_min
                 + self.omega_wait * wait_time_min
-                + self.omega_price * retail_price * energy_req_kwh
+                + self.omega_price * choice_price * energy_req_kwh
             )
 
             if generalized_cost < best_cost:
@@ -441,12 +457,20 @@ class ChargingEnv(HeronEnv):
             station_id = env_state.slot_to_station.get(slot_id)
             service_fee = float(env_state.station_prices.get(station_id, 0.25))
             retail_price = float(env_state.lmp) + service_fee
+            charge_decision_price = service_fee + self.charge_lmp_weight * float(env_state.lmp)
 
-            # Price-responsive charging: charge at max if price is viable for EV
-            if retail_price < ss.price_sensitivity * 1.2:
+            if not self.enable_in_session_price_response:
                 ss.p_kw = ss.p_max_kw
             else:
-                ss.p_kw = 0.0
+                willingness = max(ss.price_sensitivity * 1.2, 1e-6)
+                if charge_decision_price <= willingness:
+                    frac = 1.0
+                else:
+                    frac = max(
+                        self.min_charge_power_frac,
+                        willingness / max(charge_decision_price, 1e-6),
+                    )
+                ss.p_kw = ss.p_max_kw * frac
 
             energy_kwh = ss.p_kw * self.dt / 3600.0
             if energy_kwh > 0 and ss.soc < ss.soc_target:

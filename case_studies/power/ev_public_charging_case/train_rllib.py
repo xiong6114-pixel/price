@@ -16,7 +16,12 @@ from heron.core.action import Action
 
 from case_studies.power.ev_public_charging_case.agents import ChargingSlot, StationCoordinator
 from case_studies.power.ev_public_charging_case.envs.charging_env import ChargingEnv
-from case_studies.power.ev_public_charging_case.policies import IndependentTransA3CPolicy, MATransA3CPolicy, PricingPolicy
+from case_studies.power.ev_public_charging_case.policies import (
+    IndependentTransA3CPolicy,
+    MAPPOPolicy,
+    MATransA3CPolicy,
+    PricingPolicy,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -50,6 +55,87 @@ def get_soc_calibrated_config() -> Dict[str, Any]:
     }
 
 
+def get_paper_aligned_config(
+    q_threshold: float = 6.0,
+    max_queue_size: int = 15,
+    generalized_cost_threshold: float = 90.0,
+    lmp_base: float = 0.45,
+    lmp_amp: float = 0.10,
+) -> Dict[str, Any]:
+    """Paper-aligned environment config kept separate from the SOC mainline."""
+    cfg = get_soc_calibrated_config().copy()
+    cfg.update({
+        "q_threshold": q_threshold,
+        "max_queue_size": max_queue_size,
+        "generalized_cost_threshold": generalized_cost_threshold,
+        "lmp_base": lmp_base,
+        "lmp_amp": lmp_amp,
+    })
+    return cfg
+
+
+def iter_paper_aligned_grid():
+    """Small environment grid for paper-aligned reproduction."""
+    candidates = [
+        ("A_q6_max15_gc90", 6.0, 15, 90.0),
+        ("B_q8_max15_gc90", 8.0, 15, 90.0),
+        ("C_q6_max15_gc80", 6.0, 15, 80.0),
+        ("D_q8_max15_gc80", 8.0, 15, 80.0),
+    ]
+    for name, q_th, q_max, gc_th in candidates:
+        yield name, get_paper_aligned_config(
+            q_threshold=q_th,
+            max_queue_size=q_max,
+            generalized_cost_threshold=gc_th,
+            lmp_base=0.45,
+            lmp_amp=0.10,
+        )
+
+
+def get_paper_response_config(
+    q_threshold: float = 4.0,
+    max_queue_size: int = 12,
+    generalized_cost_threshold: float = 120.0,
+    omega_price: float = 0.35,
+    choice_lmp_weight: float = 0.0,
+    charge_lmp_weight: float = 0.0,
+) -> Dict[str, Any]:
+    """Response-calibrated config that preserves high-LMP accounting scale."""
+    cfg = get_paper_aligned_config(
+        q_threshold=q_threshold,
+        max_queue_size=max_queue_size,
+        generalized_cost_threshold=generalized_cost_threshold,
+        lmp_base=0.45,
+        lmp_amp=0.10,
+    )
+    cfg.update({
+        "omega_price": omega_price,
+        "choice_lmp_weight": choice_lmp_weight,
+        "charge_lmp_weight": charge_lmp_weight,
+        "enable_in_session_price_response": False,
+        "min_charge_power_frac": 0.35,
+    })
+    return cfg
+
+
+def iter_paper_response_grid():
+    """Small grid that softens demand response while keeping paper-scale LMP."""
+    candidates = [
+        ("E_q4_max12_gc120_wp035_soft", 4.0, 12, 120.0, 0.35),
+        ("F_q5_max12_gc120_wp035_soft", 5.0, 12, 120.0, 0.35),
+        ("G_q4_max12_gc100_wp025_soft", 4.0, 12, 100.0, 0.25),
+    ]
+    for name, q_th, q_max, gc_th, omega_price in candidates:
+        yield name, get_paper_response_config(
+            q_threshold=q_th,
+            max_queue_size=q_max,
+            generalized_cost_threshold=gc_th,
+            omega_price=omega_price,
+            choice_lmp_weight=0.0,
+            charge_lmp_weight=0.0,
+        )
+
+
 def create_charging_env(config: Dict[str, Any] = None) -> ChargingEnv:
   
     config = config or {}
@@ -73,6 +159,12 @@ def create_charging_env(config: Dict[str, Any] = None) -> ChargingEnv:
         "center_sigma": config.get("center_sigma", 0.55),
         "edge_sigma": config.get("edge_sigma", 0.5),
         "generalized_cost_threshold": config.get("generalized_cost_threshold", 60.0),
+        "lmp_base": config.get("lmp_base", 0.20),
+        "lmp_amp": config.get("lmp_amp", 0.10),
+        "choice_lmp_weight": config.get("choice_lmp_weight", 1.0),
+        "charge_lmp_weight": config.get("charge_lmp_weight", 1.0),
+        "enable_in_session_price_response": config.get("enable_in_session_price_response", True),
+        "min_charge_power_frac": config.get("min_charge_power_frac", 0.25),
         "station_positions": config.get("station_positions"),
     }
 
@@ -367,6 +459,68 @@ def run_fixed_pricing(
     _write_metrics(out_dir, step_logs, episode_logs)
 
     logger.info(f"[FP] Metrics saved to: {out_dir}")
+    return episode_logs, step_logs
+
+
+def run_constant_pricing(
+    price: float,
+    num_episodes: int = 1,
+    steps_per_episode: int = 96,
+    seed: int = 2026,
+    env_config: Dict[str, Any] = None,
+    output_dir: str = "outputs/constant_price",
+    algo: str = "CONST",
+):
+    """Run a constant service-fee policy for smoke diagnostics."""
+    env_config = env_config or {}
+    env = create_charging_env(env_config)
+
+    station_ids = [
+        aid for aid, agent in env.registered_agents.items()
+        if isinstance(agent, StationCoordinator)
+    ]
+
+    step_logs: List[Dict[str, Any]] = []
+    episode_logs: List[Dict[str, Any]] = []
+
+    for episode in range(num_episodes):
+        obs, info = env.reset(seed=seed + episode)
+        episode_reward = {sid: 0.0 for sid in station_ids}
+
+        actions = {
+            sid: _fixed_price_action(price)
+            for sid in station_ids
+        }
+
+        for step in range(steps_per_episode):
+            obs, rewards, terminated, truncated, infos = env.step(actions)
+            station_metrics = infos.get("__all__", {}).get("station_metrics", {})
+
+            for sid in station_ids:
+                episode_reward[sid] += float(rewards.get(sid, 0.0))
+
+            _append_step_logs(step_logs, station_metrics, algo, episode, step)
+
+            if terminated.get("__all__", False) or truncated.get("__all__", False):
+                break
+
+        total = sum(episode_reward.values())
+        episode_logs.append({
+            "algo": algo,
+            "episode": episode,
+            "total_reward": total,
+            **{f"reward_{sid}": episode_reward[sid] for sid in station_ids},
+        })
+        logger.info(
+            f"[{algo}] Episode {episode + 1:3d} | "
+            f"Total reward: {total:8.2f} | "
+            f"Per-station: {dict((k, round(v, 2)) for k, v in episode_reward.items())}"
+        )
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _write_metrics(out_dir, step_logs, episode_logs)
+    logger.info(f"[{algo}] Metrics saved to: {out_dir}")
     return episode_logs, step_logs
 
 
@@ -996,6 +1150,218 @@ def evaluate_ma_transa3c(
             f"[EVAL {algo}] Episode {episode + 1:3d} | "
             f"Total reward: {total:8.2f}"
         )
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _write_metrics(out_dir, step_logs, episode_logs)
+    logger.info(f"[EVAL {algo}] Metrics saved to: {out_dir}")
+    return episode_logs, step_logs
+
+
+def train_mappo_mlp(
+    num_episodes: int = 30,
+    steps_per_episode: int = 96,
+    seed: int = 42,
+    gamma: float = 0.99,
+    use_ma_station_obs: bool = True,
+    env_config: Dict[str, Any] = None,
+    output_dir: str = "outputs/MAPPO_MLP_train",
+    algo: str = "MAPPO-MLP",
+):
+    """Train MAPPO-MLP baseline with a centralized critic."""
+    if MAPPOPolicy is None:
+        raise ImportError("MAPPOPolicy requires PyTorch. Install torch in the active environment.")
+
+    np.random.seed(seed)
+    env = create_charging_env(env_config)
+    station_ids = [
+        aid for aid, agent in env.registered_agents.items()
+        if isinstance(agent, StationCoordinator)
+    ]
+    station_to_index = {sid: i for i, sid in enumerate(station_ids)}
+
+    policy = MAPPOPolicy(
+        obs_dim=10 if use_ma_station_obs else 8,
+        num_stations=len(station_ids),
+        hidden_dim=128,
+        actor_lr=1e-4,
+        critic_lr=5e-4,
+        gamma=gamma,
+        entropy_coef=0.01,
+        clip_eps=0.2,
+        ppo_epochs=4,
+        seed=seed,
+    )
+
+    step_logs: List[Dict[str, Any]] = []
+    episode_logs: List[Dict[str, Any]] = []
+    returns_history: List[float] = []
+
+    for episode in range(num_episodes):
+        obs, info = env.reset(seed=seed + episode)
+        episode_reward = {sid: 0.0 for sid in station_ids}
+        prev_station_metrics: Dict[str, Dict[str, Any]] = {}
+
+        traj_obs = []
+        traj_actions = []
+        traj_old_log_probs = []
+        traj_global_rewards = []
+        update_stats: Dict[str, float] = {}
+
+        for step in range(steps_per_episode):
+            raw_obs_vecs = {}
+            for sid in station_ids:
+                observation = _extract_obs_vector(obs[sid], step, obs_dim=8)
+                raw_obs_vecs[sid] = policy.extract_obs_vector(observation, 8)
+
+            obs_vecs = (
+                build_ma_station_obs_matrix(station_ids, raw_obs_vecs, prev_station_metrics, env_config)
+                if use_ma_station_obs
+                else raw_obs_vecs
+            )
+
+            obs_matrix = np.stack([obs_vecs[sid] for sid in station_ids], axis=0).astype(np.float32)
+            actions = {}
+            action_values = []
+            old_log_values = []
+
+            for sid in station_ids:
+                action_arr, old_log_prob = policy.act(
+                    obs_vecs[sid],
+                    station_index=station_to_index[sid],
+                    deterministic=False,
+                    return_log_prob=True,
+                )
+                price = float(action_arr[0])
+                actions[sid] = make_price_action(price)
+                action_values.append(price)
+                old_log_values.append(old_log_prob)
+
+            obs, rewards, terminated, truncated, infos = env.step(actions)
+            station_metrics = infos.get("__all__", {}).get("station_metrics", {})
+            prev_station_metrics = station_metrics
+            global_reward = 0.0
+
+            for sid in station_ids:
+                reward_value = float(rewards.get(sid, 0.0))
+                episode_reward[sid] += reward_value
+                global_reward += reward_value
+
+            traj_obs.append(obs_matrix)
+            traj_actions.append(np.asarray(action_values, dtype=np.float32))
+            traj_old_log_probs.append(np.asarray(old_log_values, dtype=np.float32))
+            traj_global_rewards.append(global_reward)
+
+            _append_step_logs(step_logs, station_metrics, algo, episode, step)
+
+            if terminated.get("__all__", False) or truncated.get("__all__", False):
+                break
+
+        returns = []
+        G = 0.0
+        for reward_value in reversed(traj_global_rewards):
+            G = reward_value + gamma * G
+            returns.insert(0, G)
+
+        if traj_obs:
+            update_stats = policy.update(
+                obs=np.asarray(traj_obs, dtype=np.float32),
+                actions=np.asarray(traj_actions, dtype=np.float32),
+                old_log_probs=np.asarray(traj_old_log_probs, dtype=np.float32),
+                returns=np.asarray(returns, dtype=np.float32),
+            )
+
+        total = sum(episode_reward.values())
+        returns_history.append(total)
+        episode_logs.append({
+            "algo": algo,
+            "episode": episode,
+            "total_reward": total,
+            **{f"reward_{sid}": episode_reward[sid] for sid in station_ids},
+            **update_stats,
+        })
+        logger.info(
+            f"[{algo}] Episode {episode + 1:3d} | "
+            f"Total reward: {total:8.2f} | "
+            f"actor_loss={update_stats.get('actor_loss', 0.0):.4f} | "
+            f"critic_loss={update_stats.get('critic_loss', 0.0):.4f}"
+        )
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _write_metrics(out_dir, step_logs, episode_logs)
+    logger.info(f"[{algo}] Training metrics saved to: {out_dir}")
+    return env, policy, returns_history
+
+
+def evaluate_mappo_mlp(
+    policy: "MAPPOPolicy",
+    num_episodes: int = 1,
+    steps_per_episode: int = 96,
+    seed: int = 2026,
+    use_ma_station_obs: bool = True,
+    env_config: Dict[str, Any] = None,
+    output_dir: str = "outputs/MAPPO_MLP_eval",
+    algo: str = "MAPPO-MLP",
+):
+    """Evaluate MAPPO-MLP deterministically."""
+    env = create_charging_env(env_config)
+    station_ids = [
+        aid for aid, agent in env.registered_agents.items()
+        if isinstance(agent, StationCoordinator)
+    ]
+    station_to_index = {sid: i for i, sid in enumerate(station_ids)}
+
+    step_logs: List[Dict[str, Any]] = []
+    episode_logs: List[Dict[str, Any]] = []
+
+    for episode in range(num_episodes):
+        obs, info = env.reset(seed=seed + episode)
+        episode_reward = {sid: 0.0 for sid in station_ids}
+        prev_station_metrics: Dict[str, Dict[str, Any]] = {}
+
+        for step in range(steps_per_episode):
+            raw_obs_vecs = {}
+            for sid in station_ids:
+                observation = _extract_obs_vector(obs[sid], step, obs_dim=8)
+                raw_obs_vecs[sid] = policy.extract_obs_vector(observation, 8)
+
+            obs_vecs = (
+                build_ma_station_obs_matrix(station_ids, raw_obs_vecs, prev_station_metrics, env_config)
+                if use_ma_station_obs
+                else raw_obs_vecs
+            )
+
+            actions = {}
+            for sid in station_ids:
+                action_arr = policy.act(
+                    obs_vecs[sid],
+                    station_index=station_to_index[sid],
+                    deterministic=True,
+                    return_log_prob=False,
+                )
+                actions[sid] = make_price_action(float(action_arr[0]))
+
+            obs, rewards, terminated, truncated, infos = env.step(actions)
+            station_metrics = infos.get("__all__", {}).get("station_metrics", {})
+            prev_station_metrics = station_metrics
+
+            for sid in station_ids:
+                episode_reward[sid] += float(rewards.get(sid, 0.0))
+
+            _append_step_logs(step_logs, station_metrics, algo, episode, step)
+
+            if terminated.get("__all__", False) or truncated.get("__all__", False):
+                break
+
+        total = sum(episode_reward.values())
+        episode_logs.append({
+            "algo": algo,
+            "episode": episode,
+            "total_reward": total,
+            **{f"reward_{sid}": episode_reward[sid] for sid in station_ids},
+        })
+        logger.info(f"[EVAL {algo}] Episode {episode + 1:3d} | Total reward: {total:8.2f}")
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

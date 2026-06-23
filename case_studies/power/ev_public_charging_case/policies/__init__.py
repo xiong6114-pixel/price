@@ -9,5 +9,14 @@ try:
     from .ma_transa3c_policy import MATransA3CPolicy
 except ImportError:  # Torch may not be installed yet.
     MATransA3CPolicy = None
+try:
+    from .mappo_mlp_policy import MAPPOPolicy
+except ImportError:  # Torch may not be installed yet.
+    MAPPOPolicy = None
 
-__all__ = ["PricingPolicy", "IndependentTransA3CPolicy", "MATransA3CPolicy"]
+__all__ = [
+    "PricingPolicy",
+    "IndependentTransA3CPolicy",
+    "MATransA3CPolicy",
+    "MAPPOPolicy",
+]

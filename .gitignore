@@ -1,9 +1,11 @@
-# Ignore everything by default, then explicitly keep the curated source bundle.
+# Ignore everything by default, then explicitly keep the active source tree.
 *
 !/.gitignore
 !/README.md
-!/importance/
-!/importance/**
+!/case_studies/
+!/case_studies/**
+!/heron/
+!/heron/**
 
 # Python caches
 __pycache__/
