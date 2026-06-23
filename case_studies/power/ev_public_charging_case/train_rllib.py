@@ -1729,14 +1729,24 @@ def evaluate_mappo_mlp(
 
 def _write_metrics(out_dir: Path, step_logs: List[Dict[str, Any]], episode_logs: List[Dict[str, Any]]) -> None:
     if step_logs:
+        step_fieldnames: List[str] = []
+        for row in step_logs:
+            for key in row.keys():
+                if key not in step_fieldnames:
+                    step_fieldnames.append(key)
         with (out_dir / "step_metrics.csv").open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=step_logs[0].keys())
+            writer = csv.DictWriter(f, fieldnames=step_fieldnames)
             writer.writeheader()
             writer.writerows(step_logs)
 
     if episode_logs:
+        episode_fieldnames: List[str] = []
+        for row in episode_logs:
+            for key in row.keys():
+                if key not in episode_fieldnames:
+                    episode_fieldnames.append(key)
         with (out_dir / "episode_metrics.csv").open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=episode_logs[0].keys())
+            writer = csv.DictWriter(f, fieldnames=episode_fieldnames)
             writer.writeheader()
             writer.writerows(episode_logs)
 
