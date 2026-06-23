@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+from collections import defaultdict
 from pathlib import Path
 from statistics import mean, pstdev
 from typing import Dict, List, Optional
@@ -72,6 +73,15 @@ def summarize_step_metrics(
     price = [_to_float(row, "price") for row in step_rows]
     queue_violation_flags = [1.0 if q > q_threshold else 0.0 for q in queue_len]
     queue_excess = [max(0.0, q - q_threshold) for q in queue_len]
+    network_queues = defaultdict(list)
+    for row in step_rows:
+        episode = row.get("episode")
+        step = row.get("step")
+        q = _to_float(row, "queue_len")
+        network_queues[(episode, step)].append(q)
+    network_max_queue = [max(qs) for qs in network_queues.values() if qs]
+    network_violation_flags = [1.0 if q > q_threshold else 0.0 for q in network_max_queue]
+    network_queue_excess = [max(0.0, q - q_threshold) for q in network_max_queue]
     abandoned_soc = [
         _to_float(row, "abandoned_soc") if "abandoned_soc" in row else 0.0
         for row in step_rows
@@ -113,9 +123,14 @@ def summarize_step_metrics(
         "avg_queue_len": mean(queue_len),
         "max_queue_len": max(queue_len),
         "queue_volatility": pstdev(queue_len) if len(queue_len) > 1 else 0.0,
+        "network_queue_volatility": pstdev(network_max_queue) if len(network_max_queue) > 1 else 0.0,
         "queue_violation_count": sum(queue_violation_flags),
+        "station_queue_violation_count": sum(queue_violation_flags),
+        "network_queue_violation_count": sum(network_violation_flags),
         "queue_excess_total": sum(queue_excess),
         "queue_excess_mean": mean(queue_excess),
+        "network_queue_excess_total": sum(network_queue_excess),
+        "network_queue_excess_mean": mean(network_queue_excess) if network_queue_excess else 0.0,
         "avg_utilization": mean(utilization),
         "max_utilization": max(utilization),
         "total_congestion_penalty": sum(congestion_penalty),
@@ -227,7 +242,9 @@ def print_table(rows: List[Dict[str, float]]) -> None:
         "avg_daily_network_profit_cny",
         "total_abandoned",
         "queue_volatility",
+        "network_queue_volatility",
         "queue_violation_count",
+        "network_queue_violation_count",
         "avg_queue_len",
         "avg_utilization",
         "avg_price",

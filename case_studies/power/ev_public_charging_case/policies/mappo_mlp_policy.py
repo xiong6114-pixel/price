@@ -77,6 +77,8 @@ class MAPPOPolicy:
         entropy_coef: float = 0.01,
         clip_eps: float = 0.2,
         ppo_epochs: int = 4,
+        lambda_anchor: float = 0.0,
+        price_anchor: float = 0.50,
         seed: int = 42,
         device: str | None = None,
     ):
@@ -89,6 +91,8 @@ class MAPPOPolicy:
         self.entropy_coef = entropy_coef
         self.clip_eps = clip_eps
         self.ppo_epochs = ppo_epochs
+        self.lambda_anchor = lambda_anchor
+        self.price_anchor = price_anchor
         self.action_range = (0.0, 0.8)
 
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -205,6 +209,13 @@ class MAPPOPolicy:
             surrogate_2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv_matrix
 
             actor_loss = -torch.min(surrogate_1, surrogate_2).mean() - self.entropy_coef * entropy
+            anchor_loss = torch.zeros((), dtype=torch.float32, device=self.device)
+            if self.lambda_anchor > 0.0:
+                mean_matrix = mean.view(steps, num_stations)
+                mean_price_per_step = mean_matrix.mean(dim=1)
+                anchor_target = torch.full_like(mean_price_per_step, float(self.price_anchor))
+                anchor_loss = F.relu(anchor_target - mean_price_per_step).pow(2).mean()
+                actor_loss = actor_loss + self.lambda_anchor * anchor_loss
             critic_loss = F.mse_loss(values, returns_t)
 
             self.actor_optimizer.zero_grad()
@@ -223,6 +234,8 @@ class MAPPOPolicy:
                 "critic_loss": float(critic_loss.item()),
                 "entropy": float(entropy.item()),
                 "approx_kl": float(approx_kl.item()),
+                "anchor_loss": float(anchor_loss.item()),
+                "anchor_loss_weighted": float((self.lambda_anchor * anchor_loss).item()),
             }
 
         return stats
