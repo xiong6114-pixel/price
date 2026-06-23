@@ -415,6 +415,18 @@ class ChargingEnv(HeronEnv):
         self._station_abandoned = {
             str(station_id): 0 for station_id in self.station_positions
         }
+        self._station_abandoned_soc = {
+            str(station_id): 0 for station_id in self.station_positions
+        }
+        self._station_abandoned_cost = {
+            str(station_id): 0 for station_id in self.station_positions
+        }
+        self._station_abandoned_full = {
+            str(station_id): 0 for station_id in self.station_positions
+        }
+        self._station_abandoned_timeout = {
+            str(station_id): 0 for station_id in self.station_positions
+        }
 
         # 3) Charging physics — compute p_kw from price + occupancy, update SOC
         for slot_id, ss in env_state.slot_states.items():

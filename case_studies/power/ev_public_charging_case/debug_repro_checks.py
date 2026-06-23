@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import sys
 from pathlib import Path
 
@@ -22,8 +21,6 @@ def _hash_rows(rows) -> str:
 
 
 def _run_fp(seed: int, output_dir: Path):
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
     _, step_logs = run_fixed_pricing(
         num_episodes=1,
         steps_per_episode=24,
