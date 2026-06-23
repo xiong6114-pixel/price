@@ -10,11 +10,13 @@ class MarketScenario:
         price_freq: float,
         lmp_base: float = 0.20,
         lmp_amp: float = 0.10,
+        rng=None,
     ):
         self.arrival_rate = arrival_rate
         self.price_freq = price_freq
         self.lmp_base = float(lmp_base)
         self.lmp_amp = float(lmp_amp)
+        self.rng = rng if rng is not None else np.random.default_rng()
         self.time_seconds = 0.0
         self.last_price_update = -price_freq
         self.current_lmp = self.lmp_base
@@ -27,4 +29,4 @@ class MarketScenario:
             )
             self.last_price_update = self.time_seconds
         return {"lmp": self.current_lmp, "t": self.time_seconds,
-                "arrivals": np.random.poisson(self.arrival_rate * dt / 3600.0)}
+                "arrivals": self.rng.poisson(self.arrival_rate * dt / 3600.0)}

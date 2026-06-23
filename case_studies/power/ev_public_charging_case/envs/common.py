@@ -20,6 +20,11 @@ class SlotState:
     price_sensitivity: float = 0.5
     # Revenue accumulated during this step
     revenue: float = 0.0
+    # Per-step accounting captured before departure/reset clears slot state.
+    last_step_energy_kwh: float = 0.0
+    last_step_revenue: float = 0.0
+    last_step_grid_cost: float = 0.0
+    last_step_profit: float = 0.0
 
 
 @dataclass

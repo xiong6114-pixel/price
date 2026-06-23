@@ -64,6 +64,7 @@ class ChargingEnv(HeronEnv):
             3600.0,
             lmp_base=self.lmp_base,
             lmp_amp=self.lmp_amp,
+            rng=self._rng,
         )
         self.reg_scenario = RegulationScenario(reg_freq=reg_freq, alpha=reg_alpha, seed=seed or 0)
         self._latest_station_metrics: Dict[str, Dict[str, Any]] = {}
@@ -130,12 +131,15 @@ class ChargingEnv(HeronEnv):
 
     def reset(self, *, seed: Optional[int] = None, **kwargs) -> Tuple[MultiAgentDict, MultiAgentDict]:
         """Reset environment state for a new episode."""
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
 
         self.scenario = MarketScenario(
             self._arrival_rate,
             3600.0,
             lmp_base=self.lmp_base,
             lmp_amp=self.lmp_amp,
+            rng=self._rng,
         )
         # reset regulation scenario clock too
         self.reg_scenario = RegulationScenario(
@@ -154,42 +158,6 @@ class ChargingEnv(HeronEnv):
             str(station_id): 0 for station_id in self.station_positions
         }
         self._station_abandoned = {
-            str(station_id): 0 for station_id in self.station_positions
-        }
-        self._station_abandoned_soc = {
-            str(station_id): 0 for station_id in self.station_positions
-        }
-        self._station_abandoned_cost = {
-            str(station_id): 0 for station_id in self.station_positions
-        }
-        self._station_abandoned_full = {
-            str(station_id): 0 for station_id in self.station_positions
-        }
-        self._station_abandoned_timeout = {
-            str(station_id): 0 for station_id in self.station_positions
-        }
-        self._station_abandoned_soc = {
-            str(station_id): 0 for station_id in self.station_positions
-        }
-        self._station_abandoned_cost = {
-            str(station_id): 0 for station_id in self.station_positions
-        }
-        self._station_abandoned_full = {
-            str(station_id): 0 for station_id in self.station_positions
-        }
-        self._station_abandoned_timeout = {
-            str(station_id): 0 for station_id in self.station_positions
-        }
-        self._station_abandoned_soc = {
-            str(station_id): 0 for station_id in self.station_positions
-        }
-        self._station_abandoned_cost = {
-            str(station_id): 0 for station_id in self.station_positions
-        }
-        self._station_abandoned_full = {
-            str(station_id): 0 for station_id in self.station_positions
-        }
-        self._station_abandoned_timeout = {
             str(station_id): 0 for station_id in self.station_positions
         }
         self._station_abandoned_soc = {
@@ -330,7 +298,8 @@ class ChargingEnv(HeronEnv):
             return float(self.mean_charge_time_min * max(queue_len + 1, 1))
         if self._station_empty_slots(env_state, station_id):
             return 0.0
-        batches = np.ceil(queue_len / max(open_slots, 1))
+        effective_position = queue_len + 1
+        batches = np.ceil(effective_position / max(open_slots, 1))
         return float(batches * self.mean_charge_time_min)
 
     def _choose_station_for_request(self, req: EVRequest, env_state: EnvState) -> Tuple[Optional[str], float]:
@@ -450,6 +419,10 @@ class ChargingEnv(HeronEnv):
         # 3) Charging physics — compute p_kw from price + occupancy, update SOC
         for slot_id, ss in env_state.slot_states.items():
             ss.revenue = 0.0
+            ss.last_step_energy_kwh = 0.0
+            ss.last_step_revenue = 0.0
+            ss.last_step_grid_cost = 0.0
+            ss.last_step_profit = 0.0
             if ss.occupied == 0 or ss.open_or_not == 0:
                 ss.p_kw = 0.0
                 continue
@@ -476,8 +449,15 @@ class ChargingEnv(HeronEnv):
             if energy_kwh > 0 and ss.soc < ss.soc_target:
                 battery_kwh = max(float(ss.battery_kwh), 1.0)
                 delta_soc = energy_kwh / battery_kwh
+                revenue = retail_price * energy_kwh
+                grid_cost = float(env_state.lmp) * energy_kwh
+                profit = revenue - grid_cost
+                ss.last_step_energy_kwh = energy_kwh
+                ss.last_step_revenue = revenue
+                ss.last_step_grid_cost = grid_cost
+                ss.last_step_profit = profit
                 ss.soc = min(1.0, ss.soc + delta_soc)
-                ss.revenue = service_fee * energy_kwh
+                ss.revenue = revenue
 
         # 4) EV departures — slots where SOC >= target or max wait exceeded
         for slot_id, ss in env_state.slot_states.items():
@@ -565,11 +545,10 @@ class ChargingEnv(HeronEnv):
 
             for sid in slots_of_station:
                 ss = env_state.slot_states[sid]
-                energy_kwh = ss.p_kw * env_state.dt / 3600.0
-                served_kwh += energy_kwh
-                revenue += retail_price * energy_kwh
-                grid_cost += lmp * energy_kwh
-                profit += service_fee * energy_kwh
+                served_kwh += float(ss.last_step_energy_kwh)
+                revenue += float(ss.last_step_revenue)
+                grid_cost += float(ss.last_step_grid_cost)
+                profit += float(ss.last_step_profit)
             queue_len = int(len(self._station_queues.get(st, [])))
             congestion_penalty = self.eta * max(0.0, queue_len - self.q_threshold)
             reward = profit - congestion_penalty
