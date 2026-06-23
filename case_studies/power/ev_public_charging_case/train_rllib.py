@@ -5,6 +5,7 @@ import logging
 import sys
 from collections import deque
 from pathlib import Path
+from statistics import mean
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -929,6 +930,8 @@ def train_ma_transa3c(
     response_ema_alpha: float = 0.9,
     lambda_anchor: float = 0.0,
     price_anchor: float = 0.40,
+    lambda_network_excess: float = 0.0,
+    lambda_network_flag: float = 0.0,
     env_config: Dict[str, Any] = None,
     output_dir: str = "outputs/MA_TransA3C_soc_train",
     algo: str = "MA-TransA3C",
@@ -973,6 +976,7 @@ def train_ma_transa3c(
     step_logs: List[Dict[str, Any]] = []
     episode_logs: List[Dict[str, Any]] = []
     returns_history: List[float] = []
+    q_threshold = float((env_config or {}).get("q_threshold", 4.0))
 
     for episode in range(num_episodes):
         obs, info = env.reset(seed=seed + episode)
@@ -988,6 +992,11 @@ def train_ma_transa3c(
         traj_actions = []
         traj_global_rewards = []
         prev_rank_global_obs = None
+        episode_network_max_queues = []
+        episode_network_excess = []
+        episode_network_flags = []
+        network_excess_penalty_total = 0.0
+        network_flag_penalty_total = 0.0
 
         for step in range(steps_per_episode):
             raw_obs_vecs = {}
@@ -1040,6 +1049,24 @@ def train_ma_transa3c(
                 reward_value = float(rewards.get(sid, 0.0))
                 episode_reward[sid] += reward_value
                 global_reward += reward_value
+
+            if station_metrics:
+                network_max_queue = max(
+                    float(metrics.get("queue_len", 0.0))
+                    for metrics in station_metrics.values()
+                )
+            else:
+                network_max_queue = 0.0
+            network_excess = max(0.0, network_max_queue - q_threshold)
+            network_flag = 1.0 if network_excess > 0.0 else 0.0
+            network_excess_penalty = lambda_network_excess * network_excess
+            network_flag_penalty = lambda_network_flag * network_flag
+            global_reward -= network_excess_penalty + network_flag_penalty
+            episode_network_max_queues.append(network_max_queue)
+            episode_network_excess.append(network_excess)
+            episode_network_flags.append(network_flag)
+            network_excess_penalty_total += network_excess_penalty
+            network_flag_penalty_total += network_flag_penalty
 
             traj_neighbor_seqs.append(np.stack(neighbor_seqs, axis=0))
             traj_neighbor_station_indices.append(np.stack(neighbor_station_indices, axis=0))
@@ -1100,6 +1127,13 @@ def train_ma_transa3c(
             "mu_std_across_stations": update_stats.get("mu_std_across_stations"),
             "score_std_across_stations": update_stats.get("score_std_across_stations"),
             "mean_price_mean": update_stats.get("mean_price_mean"),
+            "lambda_network_excess": lambda_network_excess,
+            "lambda_network_flag": lambda_network_flag,
+            "avg_network_max_queue": mean(episode_network_max_queues) if episode_network_max_queues else 0.0,
+            "avg_network_excess": mean(episode_network_excess) if episode_network_excess else 0.0,
+            "network_violation_steps": sum(episode_network_flags),
+            "network_excess_penalty_total": network_excess_penalty_total,
+            "network_flag_penalty_total": network_flag_penalty_total,
             **{f"reward_{sid}": episode_reward[sid] for sid in station_ids},
         })
         logger.info(
@@ -1107,6 +1141,7 @@ def train_ma_transa3c(
             f"Total reward: {total:8.2f} | "
             f"Rank loss: {update_stats.get('rank_loss', 0.0):.4f} | "
             f"Response loss: {update_stats.get('response_loss', 0.0):.4f} | "
+            f"Net excess: {(mean(episode_network_excess) if episode_network_excess else 0.0):.4f} | "
             f"Per-station: {dict((k, round(v, 2)) for k, v in episode_reward.items())}"
         )
 
