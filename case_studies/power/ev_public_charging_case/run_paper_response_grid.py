@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import argparse
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -32,7 +33,8 @@ def _write_comparison(base: Path, q_threshold: float) -> None:
 
 
 def run_one(name, cfg):
-    base = Path("D:/price/outputs") / f"paper_response_{name}"
+    base_name = name if str(name).startswith("paper_response_") else f"paper_response_{name}"
+    base = Path("D:/price/outputs") / base_name
     base.mkdir(parents=True, exist_ok=True)
 
     run_fixed_pricing(
@@ -116,7 +118,19 @@ def run_one(name, cfg):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        help="Run only the named response-grid config. Can be repeated.",
+    )
+    args = parser.parse_args()
+
+    only = set(args.only)
     for name, cfg in iter_paper_response_grid():
+        if only and name not in only:
+            continue
         print(f"\n===== RUN {name} =====")
         run_one(name, cfg)
 

@@ -1,4 +1,5 @@
 
+import argparse
 import csv
 import logging
 import sys
@@ -118,22 +119,47 @@ def get_paper_response_config(
     return cfg
 
 
+def get_paper_response_f_p30_arr50() -> Dict[str, Any]:
+    """Primary response-calibrated config selected from smoke probes."""
+    cfg = get_paper_response_config(
+        q_threshold=5.0,
+        max_queue_size=12,
+        generalized_cost_threshold=120.0,
+        omega_price=0.35,
+        choice_lmp_weight=0.0,
+        charge_lmp_weight=0.0,
+    )
+    cfg.update({
+        "p_max_kw": 30.0,
+        "arrival_rate": 50.0,
+    })
+    return cfg
+
+
 def iter_paper_response_grid():
-    """Small grid that softens demand response while keeping paper-scale LMP."""
+    """Focused response-calibrated candidate set after smoke probes."""
     candidates = [
-        ("E_q4_max12_gc120_wp035_soft", 4.0, 12, 120.0, 0.35),
-        ("F_q5_max12_gc120_wp035_soft", 5.0, 12, 120.0, 0.35),
-        ("G_q4_max12_gc100_wp025_soft", 4.0, 12, 100.0, 0.25),
+        (
+            "paper_response_F_p30_arr50",
+            get_paper_response_f_p30_arr50(),
+        ),
+        (
+            "paper_response_F_p30_arr45",
+            {
+                **get_paper_response_f_p30_arr50(),
+                "arrival_rate": 45.0,
+            },
+        ),
+        (
+            "paper_response_F_p30_arr50_q4",
+            {
+                **get_paper_response_f_p30_arr50(),
+                "q_threshold": 4.0,
+            },
+        ),
     ]
-    for name, q_th, q_max, gc_th, omega_price in candidates:
-        yield name, get_paper_response_config(
-            q_threshold=q_th,
-            max_queue_size=q_max,
-            generalized_cost_threshold=gc_th,
-            omega_price=omega_price,
-            choice_lmp_weight=0.0,
-            charge_lmp_weight=0.0,
-        )
+    for name, cfg in candidates:
+        yield name, cfg
 
 
 def create_charging_env(config: Dict[str, Any] = None) -> ChargingEnv:
