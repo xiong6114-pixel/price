@@ -1,0 +1,21 @@
+# Ignore everything by default, then explicitly keep the curated source bundle.
+*
+!/.gitignore
+!/README.md
+!/importance/
+!/importance/**
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local environments and tool state
+.venv/
+.agents/
+.codex/
+
+# Large local artifacts
+outputs/
+*.xlsx
+*.xls
+*.pdf

@@ -1,0 +1,1 @@
+"""Environment compatibility namespace."""
