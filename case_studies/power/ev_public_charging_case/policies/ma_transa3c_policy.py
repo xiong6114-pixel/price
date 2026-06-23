@@ -10,6 +10,32 @@ import torch.nn.functional as F
 from heron.core.observation import Observation
 
 
+ACTION_EPS = 1e-6
+
+
+def _squash_to_action(raw_action: torch.Tensor, action_hi: float = 0.8) -> tuple[torch.Tensor, torch.Tensor]:
+    squashed = torch.tanh(raw_action)
+    action = 0.5 * action_hi * (squashed + 1.0)
+    return action, squashed
+
+
+def _unsquash_from_action(action: torch.Tensor, action_hi: float = 0.8) -> torch.Tensor:
+    squashed = (2.0 * action / action_hi) - 1.0
+    squashed = squashed.clamp(-1.0 + ACTION_EPS, 1.0 - ACTION_EPS)
+    return torch.atanh(squashed)
+
+
+def _squashed_log_prob(
+    dist: torch.distributions.Normal,
+    raw_action: torch.Tensor,
+    action_hi: float = 0.8,
+) -> torch.Tensor:
+    _, squashed = _squash_to_action(raw_action, action_hi=action_hi)
+    scale = 0.5 * action_hi
+    correction = torch.log(scale * (1.0 - squashed.pow(2)) + ACTION_EPS)
+    return dist.log_prob(raw_action) - correction
+
+
 class SpatialTransformerActor(nn.Module):
     """Shared actor over one station plus its spatially ordered neighbors."""
 
@@ -62,7 +88,7 @@ class SpatialTransformerActor(nn.Module):
         x = self.input_proj(actor_input) + self.pos_embed[:, : seq.shape[1], :]
         h = self.encoder(x)
         center_token = h[:, 0, :]
-        mean = torch.sigmoid(self.actor_mean(center_token)) * self.action_hi
+        mean = self.actor_mean(center_token)
         std = torch.exp(self.actor_log_std).clamp(1e-3, 0.3)
         return mean.squeeze(-1), std.squeeze(-1)
 
@@ -233,11 +259,11 @@ class MATransA3CPolicy:
         with torch.no_grad():
             mean, std = self.actor(seq_t, station_idx_t, rank_idx_t, is_self_t)
             if deterministic:
-                action = mean
+                action, _ = _squash_to_action(mean, action_hi=self.actor.action_hi)
             else:
                 dist = torch.distributions.Normal(mean, std)
-                action = dist.sample()
-        action = action.clamp(0.0, 0.8)
+                raw_action = dist.rsample()
+                action, _ = _squash_to_action(raw_action, action_hi=self.actor.action_hi)
         return np.array([float(action.item())], dtype=np.float32)
 
     def update(
@@ -282,8 +308,10 @@ class MATransA3CPolicy:
         )
         dist = torch.distributions.Normal(mean, std)
         action_flat = actions_t.view(-1)
-        log_probs = dist.log_prob(action_flat).view(steps, num_stations)
-        mean_matrix = mean.view(steps, num_stations)
+        raw_action_flat = _unsquash_from_action(action_flat, action_hi=self.actor.action_hi)
+        log_probs = _squashed_log_prob(dist, raw_action_flat, action_hi=self.actor.action_hi).view(steps, num_stations)
+        mean_actions, _ = _squash_to_action(mean, action_hi=self.actor.action_hi)
+        mean_matrix = mean_actions.view(steps, num_stations)
         entropy = dist.entropy().mean()
 
         critic_station_idx = torch.as_tensor(self.global_station_indices, dtype=torch.long, device=self.device).view(1, self.num_stations).expand(steps, -1)

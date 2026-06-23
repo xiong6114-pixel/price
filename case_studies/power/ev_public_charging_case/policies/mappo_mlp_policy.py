@@ -10,6 +10,32 @@ import torch.nn.functional as F
 from heron.core.observation import Observation
 
 
+ACTION_EPS = 1e-6
+
+
+def _squash_to_action(raw_action: torch.Tensor, action_hi: float = 0.8) -> tuple[torch.Tensor, torch.Tensor]:
+    squashed = torch.tanh(raw_action)
+    action = 0.5 * action_hi * (squashed + 1.0)
+    return action, squashed
+
+
+def _unsquash_from_action(action: torch.Tensor, action_hi: float = 0.8) -> torch.Tensor:
+    squashed = (2.0 * action / action_hi) - 1.0
+    squashed = squashed.clamp(-1.0 + ACTION_EPS, 1.0 - ACTION_EPS)
+    return torch.atanh(squashed)
+
+
+def _squashed_log_prob(
+    dist: torch.distributions.Normal,
+    raw_action: torch.Tensor,
+    action_hi: float = 0.8,
+) -> torch.Tensor:
+    _, squashed = _squash_to_action(raw_action, action_hi=action_hi)
+    scale = 0.5 * action_hi
+    correction = torch.log(scale * (1.0 - squashed.pow(2)) + ACTION_EPS)
+    return dist.log_prob(raw_action) - correction
+
+
 class MLPActor(nn.Module):
     def __init__(
         self,
@@ -34,7 +60,7 @@ class MLPActor(nn.Module):
     def forward(self, obs: torch.Tensor, station_idx: torch.Tensor):
         emb = self.station_embed(station_idx)
         x = torch.cat([obs, emb], dim=-1)
-        mean = torch.sigmoid(self.net(x)).squeeze(-1) * self.action_hi
+        mean = self.net(x).squeeze(-1)
         std = torch.exp(self.log_std).clamp(1e-3, 0.3).expand_as(mean)
         return mean, std
 
@@ -159,9 +185,9 @@ class MAPPOPolicy:
         with torch.no_grad():
             mean, std = self.actor(obs_t, idx_t)
             dist = torch.distributions.Normal(mean, std)
-            action = mean if deterministic else dist.sample()
-            action = action.clamp(0.0, 0.8)
-            log_prob = dist.log_prob(action)
+            raw_action = mean if deterministic else dist.rsample()
+            action, _ = _squash_to_action(raw_action, action_hi=self.actor.action_hi)
+            log_prob = _squashed_log_prob(dist, raw_action, action_hi=self.actor.action_hi)
 
         action_np = np.array([float(action.item())], dtype=np.float32)
         if return_log_prob:
@@ -200,8 +226,10 @@ class MAPPOPolicy:
             dist = torch.distributions.Normal(mean, std)
 
             flat_actions = actions_t.reshape(steps * num_stations)
-            new_log = dist.log_prob(flat_actions).view(steps, num_stations)
+            raw_actions = _unsquash_from_action(flat_actions, action_hi=self.actor.action_hi)
+            new_log = _squashed_log_prob(dist, raw_actions, action_hi=self.actor.action_hi).view(steps, num_stations)
             entropy = dist.entropy().mean()
+            mean_actions, _ = _squash_to_action(mean, action_hi=self.actor.action_hi)
 
             adv_matrix = advantages.view(steps, 1).expand(steps, num_stations)
             ratio = torch.exp(new_log - old_log_t)
@@ -211,7 +239,7 @@ class MAPPOPolicy:
             actor_loss = -torch.min(surrogate_1, surrogate_2).mean() - self.entropy_coef * entropy
             anchor_loss = torch.zeros((), dtype=torch.float32, device=self.device)
             if self.lambda_anchor > 0.0:
-                mean_matrix = mean.view(steps, num_stations)
+                mean_matrix = mean_actions.view(steps, num_stations)
                 mean_price_per_step = mean_matrix.mean(dim=1)
                 anchor_target = torch.full_like(mean_price_per_step, float(self.price_anchor))
                 anchor_loss = F.relu(anchor_target - mean_price_per_step).pow(2).mean()
@@ -234,7 +262,7 @@ class MAPPOPolicy:
                 "critic_loss": float(critic_loss.item()),
                 "entropy": float(entropy.item()),
                 "approx_kl": float(approx_kl.item()),
-                "actor_mean_price": float(mean.detach().mean().item()),
+                "actor_mean_price": float(mean_actions.detach().mean().item()),
                 "anchor_loss": float(anchor_loss.item()),
                 "anchor_loss_weighted": float((self.lambda_anchor * anchor_loss).item()),
             }

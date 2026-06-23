@@ -10,6 +10,32 @@ import torch.nn.functional as F
 from heron.core.observation import Observation
 
 
+ACTION_EPS = 1e-6
+
+
+def _squash_to_action(raw_action: torch.Tensor, action_hi: float = 0.8) -> tuple[torch.Tensor, torch.Tensor]:
+    squashed = torch.tanh(raw_action)
+    action = 0.5 * action_hi * (squashed + 1.0)
+    return action, squashed
+
+
+def _unsquash_from_action(action: torch.Tensor, action_hi: float = 0.8) -> torch.Tensor:
+    squashed = (2.0 * action / action_hi) - 1.0
+    squashed = squashed.clamp(-1.0 + ACTION_EPS, 1.0 - ACTION_EPS)
+    return torch.atanh(squashed)
+
+
+def _squashed_log_prob(
+    dist: torch.distributions.Normal,
+    raw_action: torch.Tensor,
+    action_hi: float = 0.8,
+) -> torch.Tensor:
+    _, squashed = _squash_to_action(raw_action, action_hi=action_hi)
+    scale = 0.5 * action_hi
+    correction = torch.log(scale * (1.0 - squashed.pow(2)) + ACTION_EPS)
+    return dist.log_prob(raw_action) - correction
+
+
 class TemporalTransformerActorCritic(nn.Module):
     """Temporal Transformer encoder with independent actor and critic heads."""
 
@@ -64,7 +90,7 @@ class TemporalTransformerActorCritic(nn.Module):
         h = self.encoder(x)
         last = h[:, -1, :]
 
-        mean = torch.sigmoid(self.actor_mean(last)) * self.action_hi
+        mean = self.actor_mean(last)
         std = torch.exp(self.actor_log_std).clamp(1e-3, 0.3)
 
         value = self.critic(last).squeeze(-1)
@@ -159,12 +185,12 @@ class IndependentTransA3CPolicy:
         with torch.no_grad():
             mean, std, _value = self.model(seq_t)
             if deterministic:
-                action = mean
+                action, _ = _squash_to_action(mean, action_hi=self.model.action_hi)
             else:
                 dist = torch.distributions.Normal(mean, std)
-                action = dist.sample()
+                raw_action = dist.rsample()
+                action, _ = _squash_to_action(raw_action, action_hi=self.model.action_hi)
 
-        action = action.clamp(0.0, 0.8)
         return np.array([float(action.item())], dtype=np.float32)
 
     def update(self, seqs: np.ndarray, actions: np.ndarray, returns: np.ndarray):
@@ -177,9 +203,10 @@ class IndependentTransA3CPolicy:
 
         mean, std, values = self.model(seqs_t)
         dist = torch.distributions.Normal(mean, std)
-
-        log_probs = dist.log_prob(actions_t)
+        raw_actions_t = _unsquash_from_action(actions_t, action_hi=self.model.action_hi)
+        log_probs = _squashed_log_prob(dist, raw_actions_t, action_hi=self.model.action_hi)
         entropy = dist.entropy().mean()
+        mean_actions, _ = _squash_to_action(mean, action_hi=self.model.action_hi)
 
         advantages = returns_t - values.detach()
         if advantages.numel() > 1:
@@ -199,4 +226,5 @@ class IndependentTransA3CPolicy:
             "actor_loss": float(actor_loss.item()),
             "critic_loss": float(critic_loss.item()),
             "entropy": float(entropy.item()),
+            "actor_mean_price": float(mean_actions.detach().mean().item()),
         }

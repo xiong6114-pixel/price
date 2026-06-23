@@ -3,9 +3,10 @@ import argparse
 import csv
 import logging
 import sys
+from copy import deepcopy
 from collections import deque
 from pathlib import Path
-from statistics import mean
+from statistics import mean, pstdev
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -707,12 +708,61 @@ def build_ma_station_obs_matrix(
     return ma_obs
 
 
+def _summarize_validation_step_logs(
+    step_logs: List[Dict[str, Any]],
+    q_threshold: float,
+) -> Dict[str, float]:
+    if not step_logs:
+        return {
+            "episodes": 0.0,
+            "avg_daily_profit": 0.0,
+            "queue_volatility": 0.0,
+            "network_queue_violation_count": 0.0,
+            "avg_network_queue_violation_count": 0.0,
+        }
+
+    episodes = max(len({row["episode"] for row in step_logs}), 1)
+    queue_len = [float(row["queue_len"]) for row in step_logs]
+    total_profit = sum(float(row["profit"]) for row in step_logs)
+    network_queues: Dict[tuple[int, int], List[float]] = {}
+    for row in step_logs:
+        key = (int(row["episode"]), int(row["step"]))
+        network_queues.setdefault(key, []).append(float(row["queue_len"]))
+    network_max_queue = [max(values) for values in network_queues.values() if values]
+    network_viol = sum(1.0 for q in network_max_queue if q > q_threshold)
+
+    return {
+        "episodes": float(episodes),
+        "avg_daily_profit": total_profit / float(episodes),
+        "queue_volatility": pstdev(queue_len) if len(queue_len) > 1 else 0.0,
+        "network_queue_violation_count": float(network_viol),
+        "avg_network_queue_violation_count": float(network_viol) / float(episodes),
+    }
+
+
+def _validation_selection_score(
+    summary: Dict[str, float],
+    qvol_weight: float = 300.0,
+    network_viol_weight: float = 20.0,
+) -> float:
+    return (
+        float(summary["avg_daily_profit"])
+        - qvol_weight * float(summary["queue_volatility"])
+        - network_viol_weight * float(summary["avg_network_queue_violation_count"])
+    )
+
+
 def train_independent_transa3c(
     num_episodes: int = 50,
     steps_per_episode: int = 96,
     seed: int = 42,
     gamma: float = 0.99,
     seq_len: int = 8,
+    validation_every: int = 5,
+    validation_num_episodes: int = 5,
+    validation_seed: int = 3000,
+    validation_qvol_weight: float = 300.0,
+    validation_network_viol_weight: float = 20.0,
     env_config: Dict[str, Any] = None,
     output_dir: str = "outputs/i_transa3c_train",
     algo: str = "I-TransA3C",
@@ -748,6 +798,35 @@ def train_independent_transa3c(
     step_logs: List[Dict[str, Any]] = []
     episode_logs: List[Dict[str, Any]] = []
     returns_history: List[float] = []
+    q_threshold = float((env_config or {}).get("q_threshold", 4.0))
+    best_policy_states = None
+    best_validation_score = float("-inf")
+    best_validation_episode = 0
+
+    def _run_validation_rollout() -> List[Dict[str, Any]]:
+        val_env = create_charging_env(env_config)
+        val_step_logs: List[Dict[str, Any]] = []
+        for val_episode in range(validation_num_episodes):
+            obs, _info = val_env.reset(seed=validation_seed + val_episode)
+            histories = {
+                sid: deque([np.zeros(8, dtype=np.float32) for _ in range(seq_len)], maxlen=seq_len)
+                for sid in station_ids
+            }
+            for step in range(steps_per_episode):
+                actions = {}
+                for sid in station_ids:
+                    observation = _extract_obs_vector(obs[sid], step, obs_dim=8)
+                    obs_vec = policies[sid].extract_obs_vector(observation, 8)
+                    histories[sid].append(obs_vec)
+                    seq = np.stack(list(histories[sid]), axis=0).astype(np.float32)
+                    action_arr = policies[sid].act(seq, deterministic=True)
+                    actions[sid] = make_price_action(float(action_arr[0]))
+                obs, _rewards, terminated, truncated, infos = val_env.step(actions)
+                station_metrics = infos.get("__all__", {}).get("station_metrics", {})
+                _append_step_logs(val_step_logs, station_metrics, algo, val_episode, step)
+                if terminated.get("__all__", False) or truncated.get("__all__", False):
+                    break
+        return val_step_logs
 
     for episode in range(num_episodes):
         obs, info = env.reset(seed=seed + episode)
@@ -820,11 +899,48 @@ def train_independent_transa3c(
             "total_reward": total,
             **{f"reward_{sid}": episode_reward[sid] for sid in station_ids},
         })
+        if validation_num_episodes > 0 and validation_every > 0 and (episode + 1) % validation_every == 0:
+            val_step_logs = _run_validation_rollout()
+            val_summary = _summarize_validation_step_logs(val_step_logs, q_threshold=q_threshold)
+            val_score = _validation_selection_score(
+                val_summary,
+                qvol_weight=validation_qvol_weight,
+                network_viol_weight=validation_network_viol_weight,
+            )
+            is_best = val_score > best_validation_score
+            if is_best:
+                best_validation_score = val_score
+                best_validation_episode = episode + 1
+                best_policy_states = {
+                    sid: deepcopy(policies[sid].model.state_dict())
+                    for sid in station_ids
+                }
+            episode_logs[-1].update({
+                "validation_score": val_score,
+                "validation_profit": val_summary["avg_daily_profit"],
+                "validation_queue_volatility": val_summary["queue_volatility"],
+                "validation_network_queue_violation_count": val_summary["avg_network_queue_violation_count"],
+                "selected_checkpoint": 1 if is_best else 0,
+            })
+            logger.info(
+                f"[{algo}] Validation @ ep {episode + 1:3d} | "
+                f"score={val_score:.2f} profit={val_summary['avg_daily_profit']:.2f} "
+                f"qvol={val_summary['queue_volatility']:.4f} "
+                f"net_viol/ep={val_summary['avg_network_queue_violation_count']:.2f}"
+            )
 
         logger.info(
             f"[{algo}] Episode {episode + 1:3d} | "
             f"Total reward: {total:8.2f} | "
             f"Per-station: {dict((k, round(v, 2)) for k, v in episode_reward.items())}"
+        )
+
+    if best_policy_states is not None:
+        for sid in station_ids:
+            policies[sid].model.load_state_dict(best_policy_states[sid])
+        logger.info(
+            f"[{algo}] Restored best validation checkpoint from episode {best_validation_episode} "
+            f"(score={best_validation_score:.2f})."
         )
 
     out_dir = Path(output_dir)
@@ -932,6 +1048,11 @@ def train_ma_transa3c(
     price_anchor: float = 0.40,
     lambda_network_excess: float = 0.0,
     lambda_network_flag: float = 0.0,
+    validation_every: int = 5,
+    validation_num_episodes: int = 5,
+    validation_seed: int = 3000,
+    validation_qvol_weight: float = 300.0,
+    validation_network_viol_weight: float = 20.0,
     env_config: Dict[str, Any] = None,
     output_dir: str = "outputs/MA_TransA3C_soc_train",
     algo: str = "MA-TransA3C",
@@ -977,6 +1098,44 @@ def train_ma_transa3c(
     episode_logs: List[Dict[str, Any]] = []
     returns_history: List[float] = []
     q_threshold = float((env_config or {}).get("q_threshold", 4.0))
+    best_actor_state = None
+    best_critic_state = None
+    best_validation_score = float("-inf")
+    best_validation_episode = 0
+
+    def _run_validation_rollout() -> List[Dict[str, Any]]:
+        val_env = create_charging_env(env_config)
+        val_step_logs: List[Dict[str, Any]] = []
+        for val_episode in range(validation_num_episodes):
+            obs, _info = val_env.reset(seed=validation_seed + val_episode)
+            prev_station_metrics: Dict[str, Dict[str, Any]] = {}
+            for step in range(steps_per_episode):
+                raw_obs_vecs = {}
+                for sid in station_ids:
+                    observation = _extract_obs_vector(obs[sid], step, obs_dim=8)
+                    raw_obs_vecs[sid] = policy.extract_obs_vector(observation, 8)
+                obs_vecs = (
+                    build_ma_station_obs_matrix(station_ids, raw_obs_vecs, prev_station_metrics, env_config)
+                    if use_ma_station_obs
+                    else raw_obs_vecs
+                )
+                actions = {}
+                for sid in station_ids:
+                    neighbor_seq = np.stack([obs_vecs[nid] for nid in neighbor_index[sid]], axis=0).astype(np.float32)
+                    action_arr = policy.act(
+                        neighbor_seq,
+                        neighbor_station_indices=neighbor_station_arrays[sid],
+                        center_station_index=center_station_indices[sid],
+                        deterministic=True,
+                    )
+                    actions[sid] = make_price_action(float(action_arr[0]))
+                obs, _rewards, terminated, truncated, infos = val_env.step(actions)
+                station_metrics = infos.get("__all__", {}).get("station_metrics", {})
+                prev_station_metrics = station_metrics
+                _append_step_logs(val_step_logs, station_metrics, algo, val_episode, step)
+                if terminated.get("__all__", False) or truncated.get("__all__", False):
+                    break
+        return val_step_logs
 
     for episode in range(num_episodes):
         obs, info = env.reset(seed=seed + episode)
@@ -1136,6 +1295,33 @@ def train_ma_transa3c(
             "network_flag_penalty_total": network_flag_penalty_total,
             **{f"reward_{sid}": episode_reward[sid] for sid in station_ids},
         })
+        if validation_num_episodes > 0 and validation_every > 0 and (episode + 1) % validation_every == 0:
+            val_step_logs = _run_validation_rollout()
+            val_summary = _summarize_validation_step_logs(val_step_logs, q_threshold=q_threshold)
+            val_score = _validation_selection_score(
+                val_summary,
+                qvol_weight=validation_qvol_weight,
+                network_viol_weight=validation_network_viol_weight,
+            )
+            is_best = val_score > best_validation_score
+            if is_best:
+                best_validation_score = val_score
+                best_validation_episode = episode + 1
+                best_actor_state = deepcopy(policy.actor.state_dict())
+                best_critic_state = deepcopy(policy.critic.state_dict())
+            episode_logs[-1].update({
+                "validation_score": val_score,
+                "validation_profit": val_summary["avg_daily_profit"],
+                "validation_queue_volatility": val_summary["queue_volatility"],
+                "validation_network_queue_violation_count": val_summary["avg_network_queue_violation_count"],
+                "selected_checkpoint": 1 if is_best else 0,
+            })
+            logger.info(
+                f"[{algo}] Validation @ ep {episode + 1:3d} | "
+                f"score={val_score:.2f} profit={val_summary['avg_daily_profit']:.2f} "
+                f"qvol={val_summary['queue_volatility']:.4f} "
+                f"net_viol/ep={val_summary['avg_network_queue_violation_count']:.2f}"
+            )
         logger.info(
             f"[{algo}] Episode {episode + 1:3d} | "
             f"Total reward: {total:8.2f} | "
@@ -1143,6 +1329,14 @@ def train_ma_transa3c(
             f"Response loss: {update_stats.get('response_loss', 0.0):.4f} | "
             f"Net excess: {(mean(episode_network_excess) if episode_network_excess else 0.0):.4f} | "
             f"Per-station: {dict((k, round(v, 2)) for k, v in episode_reward.items())}"
+        )
+
+    if best_actor_state is not None and best_critic_state is not None:
+        policy.actor.load_state_dict(best_actor_state)
+        policy.critic.load_state_dict(best_critic_state)
+        logger.info(
+            f"[{algo}] Restored best validation checkpoint from episode {best_validation_episode} "
+            f"(score={best_validation_score:.2f})."
         )
 
     out_dir = Path(output_dir)
@@ -1247,6 +1441,11 @@ def train_mappo_mlp(
     ppo_epochs: int = 4,
     lambda_anchor: float = 0.0,
     price_anchor: float = 0.50,
+    validation_every: int = 5,
+    validation_num_episodes: int = 5,
+    validation_seed: int = 3000,
+    validation_qvol_weight: float = 300.0,
+    validation_network_viol_weight: float = 20.0,
     env_config: Dict[str, Any] = None,
     output_dir: str = "outputs/MAPPO_MLP_train",
     algo: str = "MAPPO-MLP",
@@ -1281,6 +1480,44 @@ def train_mappo_mlp(
     step_logs: List[Dict[str, Any]] = []
     episode_logs: List[Dict[str, Any]] = []
     returns_history: List[float] = []
+    q_threshold = float((env_config or {}).get("q_threshold", 4.0))
+    best_actor_state = None
+    best_critic_state = None
+    best_validation_score = float("-inf")
+    best_validation_episode = 0
+
+    def _run_validation_rollout() -> List[Dict[str, Any]]:
+        val_env = create_charging_env(env_config)
+        val_step_logs: List[Dict[str, Any]] = []
+        for val_episode in range(validation_num_episodes):
+            obs, _info = val_env.reset(seed=validation_seed + val_episode)
+            prev_station_metrics: Dict[str, Dict[str, Any]] = {}
+            for step in range(steps_per_episode):
+                raw_obs_vecs = {}
+                for sid in station_ids:
+                    observation = _extract_obs_vector(obs[sid], step, obs_dim=8)
+                    raw_obs_vecs[sid] = policy.extract_obs_vector(observation, 8)
+                obs_vecs = (
+                    build_ma_station_obs_matrix(station_ids, raw_obs_vecs, prev_station_metrics, env_config)
+                    if use_ma_station_obs
+                    else raw_obs_vecs
+                )
+                actions = {}
+                for sid in station_ids:
+                    action_arr = policy.act(
+                        obs_vecs[sid],
+                        station_index=station_to_index[sid],
+                        deterministic=True,
+                        return_log_prob=False,
+                    )
+                    actions[sid] = make_price_action(float(action_arr[0]))
+                obs, _rewards, terminated, truncated, infos = val_env.step(actions)
+                station_metrics = infos.get("__all__", {}).get("station_metrics", {})
+                prev_station_metrics = station_metrics
+                _append_step_logs(val_step_logs, station_metrics, algo, val_episode, step)
+                if terminated.get("__all__", False) or truncated.get("__all__", False):
+                    break
+        return val_step_logs
 
     for episode in range(num_episodes):
         obs, info = env.reset(seed=seed + episode)
@@ -1365,11 +1602,46 @@ def train_mappo_mlp(
             **{f"reward_{sid}": episode_reward[sid] for sid in station_ids},
             **update_stats,
         })
+        if validation_num_episodes > 0 and validation_every > 0 and (episode + 1) % validation_every == 0:
+            val_step_logs = _run_validation_rollout()
+            val_summary = _summarize_validation_step_logs(val_step_logs, q_threshold=q_threshold)
+            val_score = _validation_selection_score(
+                val_summary,
+                qvol_weight=validation_qvol_weight,
+                network_viol_weight=validation_network_viol_weight,
+            )
+            is_best = val_score > best_validation_score
+            if is_best:
+                best_validation_score = val_score
+                best_validation_episode = episode + 1
+                best_actor_state = deepcopy(policy.actor.state_dict())
+                best_critic_state = deepcopy(policy.critic.state_dict())
+            episode_logs[-1].update({
+                "validation_score": val_score,
+                "validation_profit": val_summary["avg_daily_profit"],
+                "validation_queue_volatility": val_summary["queue_volatility"],
+                "validation_network_queue_violation_count": val_summary["avg_network_queue_violation_count"],
+                "selected_checkpoint": 1 if is_best else 0,
+            })
+            logger.info(
+                f"[{algo}] Validation @ ep {episode + 1:3d} | "
+                f"score={val_score:.2f} profit={val_summary['avg_daily_profit']:.2f} "
+                f"qvol={val_summary['queue_volatility']:.4f} "
+                f"net_viol/ep={val_summary['avg_network_queue_violation_count']:.2f}"
+            )
         logger.info(
             f"[{algo}] Episode {episode + 1:3d} | "
             f"Total reward: {total:8.2f} | "
             f"actor_loss={update_stats.get('actor_loss', 0.0):.4f} | "
             f"critic_loss={update_stats.get('critic_loss', 0.0):.4f}"
+        )
+
+    if best_actor_state is not None and best_critic_state is not None:
+        policy.actor.load_state_dict(best_actor_state)
+        policy.critic.load_state_dict(best_critic_state)
+        logger.info(
+            f"[{algo}] Restored best validation checkpoint from episode {best_validation_episode} "
+            f"(score={best_validation_score:.2f})."
         )
 
     out_dir = Path(output_dir)
