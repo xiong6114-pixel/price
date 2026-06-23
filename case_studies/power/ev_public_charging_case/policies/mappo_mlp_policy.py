@@ -234,6 +234,7 @@ class MAPPOPolicy:
                 "critic_loss": float(critic_loss.item()),
                 "entropy": float(entropy.item()),
                 "approx_kl": float(approx_kl.item()),
+                "actor_mean_price": float(mean.detach().mean().item()),
                 "anchor_loss": float(anchor_loss.item()),
                 "anchor_loss_weighted": float((self.lambda_anchor * anchor_loss).item()),
             }

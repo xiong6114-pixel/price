@@ -1084,6 +1084,7 @@ def train_ma_transa3c(
             "actor_loss_pg": update_stats.get("actor_loss_pg"),
             "critic_loss": update_stats.get("critic_loss"),
             "entropy": update_stats.get("entropy"),
+            "actor_mean_price": update_stats.get("actor_mean_price"),
             "rank_loss": update_stats.get("rank_loss"),
             "rank_loss_weighted": update_stats.get("rank_loss_weighted"),
             "rank_pair_count": update_stats.get("rank_pair_count"),

@@ -382,6 +382,7 @@ class MATransA3CPolicy:
             "actor_loss_pg": float(actor_loss_pg.item()),
             "critic_loss": float(critic_loss.item()),
             "entropy": float(entropy.item()),
+            "actor_mean_price": float(mean_matrix.detach().mean().item()),
             "rank_loss": float(rank_loss.item()),
             "rank_loss_weighted": float((self.lambda_rank * rank_loss).item()),
             "rank_pair_count": float(rank_pair_count),
