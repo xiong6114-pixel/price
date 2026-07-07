@@ -58,7 +58,14 @@ class ChargingEnv(HeronEnv):
         self.real_order_arrival_scale = float(kwargs.get("real_order_arrival_scale", 1.0))
         self.real_order_date_filter = str(kwargs.get("real_order_date_filter", "dominant_month"))
         self.real_order_min_energy_kwh = float(kwargs.get("real_order_min_energy_kwh", 0.1))
+        self.real_order_daily_dir = kwargs.get("real_order_daily_dir", None)
+        self.real_order_sampling_mode = str(kwargs.get("real_order_sampling_mode", "replay"))
+        self.real_order_target_orders_per_day = kwargs.get("real_order_target_orders_per_day", None)
         self.real_order_use_lmp = bool(kwargs.get("real_order_use_lmp", False))
+        self.real_order_split = str(kwargs.get("real_order_split", "all"))
+        self.real_order_train_days = int(kwargs.get("real_order_train_days", 20))
+        self.real_order_validation_days = int(kwargs.get("real_order_validation_days", 5))
+        self.real_order_test_days = int(kwargs.get("real_order_test_days", 0))
 
         self._time_s = 0.0
 
@@ -70,6 +77,7 @@ class ChargingEnv(HeronEnv):
         self.reg_scenario = RegulationScenario(reg_freq=reg_freq, alpha=reg_alpha, seed=seed or 0)
         self._latest_station_metrics: Dict[str, Dict[str, Any]] = {}
         self._latest_reg_metrics: Dict[str, Any] = {}
+        self._latest_scenario_metrics: Dict[str, Any] = {}
 
         # Build slot → station mapping from coordinator subordinates
         self._slot_to_station: Dict[str, str] = {}
@@ -127,17 +135,24 @@ class ChargingEnv(HeronEnv):
         )
 
     def _build_market_scenario(self, seed: Optional[int] = None):
-        if self.real_order_data_path:
+        if self.real_order_data_path or self.real_order_daily_dir:
             return RealOrderScenario(
-                data_path=str(self.real_order_data_path),
+                data_path=str(self.real_order_data_path) if self.real_order_data_path else None,
                 sheet_name=self.real_order_sheet_name,
                 arrival_scale=self.real_order_arrival_scale,
                 date_filter=self.real_order_date_filter,
                 min_energy_kwh=self.real_order_min_energy_kwh,
+                daily_dir=str(self.real_order_daily_dir) if self.real_order_daily_dir else None,
+                sampling_mode=self.real_order_sampling_mode,
+                target_orders_per_day=self.real_order_target_orders_per_day,
                 lmp_base=self.lmp_base,
                 lmp_amp=self.lmp_amp,
                 price_freq=3600.0,
                 use_order_lmp=self.real_order_use_lmp,
+                split=self.real_order_split,
+                train_days=self.real_order_train_days,
+                validation_days=self.real_order_validation_days,
+                test_days=self.real_order_test_days,
                 seed=seed,
             )
         return MarketScenario(
@@ -168,6 +183,7 @@ class ChargingEnv(HeronEnv):
         self._time_s = 0.0
         self._latest_station_metrics = {}
         self._latest_reg_metrics = {}
+        self._latest_scenario_metrics = {}
         self._station_queues = {
             str(station_id): [] for station_id in self.station_positions
         }
@@ -212,6 +228,7 @@ class ChargingEnv(HeronEnv):
         if "__all__" not in infos:
             infos["__all__"] = {}
         infos["__all__"].update(getattr(self, "_latest_reg_metrics", {}))
+        infos["__all__"].update(getattr(self, "_latest_scenario_metrics", {}))
         infos["__all__"]["station_metrics"] = getattr(self, "_latest_station_metrics", {})
 
         for sid, metrics in getattr(self, "_latest_station_metrics", {}).items():
@@ -455,6 +472,19 @@ class ChargingEnv(HeronEnv):
         env_state.lmp = float(scenario_data["lmp"])
         env_state.time_s = float(scenario_data["t"])
         env_state.new_arrivals = int(scenario_data["arrivals"])
+        self._latest_scenario_metrics = {
+            key: scenario_data[key]
+            for key in (
+                "real_order_day",
+                "real_order_split",
+                "real_order_sampling_mode",
+                "real_order_target_orders_per_day",
+                "real_order_episode_records",
+                "raw_real_order_arrivals",
+                "scaled_real_order_arrivals",
+            )
+            if key in scenario_data
+        }
 
         # 1b) Advance regulation scenario (Route A: metrics only)
         reg_data = self.reg_scenario.step(self.dt)
@@ -642,8 +672,9 @@ class ChargingEnv(HeronEnv):
             )
 
         env_state.station_metrics = station_metrics
+        scenario_metrics = getattr(self, "_latest_scenario_metrics", {})
         self._latest_station_metrics = {
-            sid: metrics.__dict__.copy()
+            sid: {**metrics.__dict__.copy(), **scenario_metrics}
             for sid, metrics in station_metrics.items()
         }
 

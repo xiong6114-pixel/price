@@ -82,6 +82,42 @@ def summarize_step_metrics(
     network_max_queue = [max(qs) for qs in network_queues.values() if qs]
     network_violation_flags = [1.0 if q > q_threshold else 0.0 for q in network_max_queue]
     network_queue_excess = [max(0.0, q - q_threshold) for q in network_max_queue]
+    per_episode = defaultdict(lambda: {
+        "served_kwh": 0.0,
+        "profit": 0.0,
+        "abandoned": 0.0,
+        "queue_len": [],
+        "network_max_queue": [],
+        "network_violation_count": 0.0,
+    })
+    for row in step_rows:
+        episode = row.get("episode")
+        per_episode[episode]["served_kwh"] += _to_float(row, "served_kwh")
+        per_episode[episode]["profit"] += _to_float(row, "profit")
+        per_episode[episode]["abandoned"] += _to_float(row, "abandoned")
+        per_episode[episode]["queue_len"].append(_to_float(row, "queue_len"))
+    for (episode, _step), qs in network_queues.items():
+        if not qs:
+            continue
+        max_q = max(qs)
+        per_episode[episode]["network_max_queue"].append(max_q)
+        if max_q > q_threshold:
+            per_episode[episode]["network_violation_count"] += 1.0
+    daily_profit = [values["profit"] for values in per_episode.values()]
+    daily_served_kwh = [values["served_kwh"] for values in per_episode.values()]
+    daily_abandoned = [values["abandoned"] for values in per_episode.values()]
+    daily_queue_volatility = [
+        pstdev(values["queue_len"]) if len(values["queue_len"]) > 1 else 0.0
+        for values in per_episode.values()
+    ]
+    daily_network_queue_volatility = [
+        pstdev(values["network_max_queue"]) if len(values["network_max_queue"]) > 1 else 0.0
+        for values in per_episode.values()
+    ]
+    daily_network_violations = [
+        values["network_violation_count"]
+        for values in per_episode.values()
+    ]
     abandoned_soc = [
         _to_float(row, "abandoned_soc") if "abandoned_soc" in row else 0.0
         for row in step_rows
@@ -106,15 +142,18 @@ def summarize_step_metrics(
         "steps_per_episode": float(steps),
         "stations": float(stations),
         "avg_daily_charging_volume_kwh": sum(served_kwh) / daily_divisor,
+        "std_daily_charging_volume_kwh": pstdev(daily_served_kwh) if len(daily_served_kwh) > 1 else 0.0,
         "avg_daily_total_revenue_cny": sum(revenue) / daily_divisor,
         "avg_daily_electricity_cost_cny": sum(grid_cost) / daily_divisor,
         "avg_daily_network_profit_cny": sum(profit) / daily_divisor,
+        "std_daily_network_profit_cny": pstdev(daily_profit) if len(daily_profit) > 1 else 0.0,
         "total_served_kwh": sum(served_kwh),
         "total_revenue": sum(revenue),
         "total_grid_cost": sum(grid_cost),
         "total_profit": sum(profit),
         "total_reward_from_steps": sum(reward),
         "total_abandoned": sum(abandoned),
+        "std_daily_abandoned": pstdev(daily_abandoned) if len(daily_abandoned) > 1 else 0.0,
         "total_abandoned_soc": sum(abandoned_soc),
         "total_abandoned_cost": sum(abandoned_cost),
         "total_abandoned_full": sum(abandoned_full),
@@ -123,10 +162,22 @@ def summarize_step_metrics(
         "avg_queue_len": mean(queue_len),
         "max_queue_len": max(queue_len),
         "queue_volatility": pstdev(queue_len) if len(queue_len) > 1 else 0.0,
+        "std_daily_queue_volatility": pstdev(daily_queue_volatility) if len(daily_queue_volatility) > 1 else 0.0,
         "network_queue_volatility": pstdev(network_max_queue) if len(network_max_queue) > 1 else 0.0,
+        "std_daily_network_queue_volatility": (
+            pstdev(daily_network_queue_volatility)
+            if len(daily_network_queue_volatility) > 1
+            else 0.0
+        ),
         "queue_violation_count": sum(queue_violation_flags),
         "station_queue_violation_count": sum(queue_violation_flags),
         "network_queue_violation_count": sum(network_violation_flags),
+        "avg_daily_network_queue_violation_count": sum(network_violation_flags) / daily_divisor,
+        "std_daily_network_queue_violation_count": (
+            pstdev(daily_network_violations)
+            if len(daily_network_violations) > 1
+            else 0.0
+        ),
         "queue_excess_total": sum(queue_excess),
         "queue_excess_mean": mean(queue_excess),
         "network_queue_excess_total": sum(network_queue_excess),
@@ -240,11 +291,14 @@ def print_table(rows: List[Dict[str, float]]) -> None:
         "avg_daily_total_revenue_cny",
         "avg_daily_electricity_cost_cny",
         "avg_daily_network_profit_cny",
+        "std_daily_network_profit_cny",
         "total_abandoned",
         "queue_volatility",
         "network_queue_volatility",
         "queue_violation_count",
         "network_queue_violation_count",
+        "avg_daily_network_queue_violation_count",
+        "std_daily_network_queue_violation_count",
         "avg_queue_len",
         "avg_utilization",
         "avg_price",

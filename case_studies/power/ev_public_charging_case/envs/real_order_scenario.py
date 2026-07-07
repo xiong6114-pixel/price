@@ -7,12 +7,13 @@ the required worksheet directly from the xlsx zip/xml structure.
 
 from __future__ import annotations
 
+import csv
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 import re
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
@@ -30,6 +31,8 @@ COL_END_SOC = "\u7ed3\u675fSOC\uff08%\uff09"
 COL_ELECTRICITY_FEE = "\u8ba2\u5355\u7535\u8d39\uff08\u5143\uff09"
 COL_SERVICE_FEE = "\u8ba2\u5355\u670d\u52a1\u8d39\uff08\u5143\uff09"
 STATUS_DONE = "\u5df2\u5b8c\u6210"
+REQUIRED_ORDER_COLUMNS = (COL_ENERGY_KWH,)
+TIME_ORDER_COLUMNS = (COL_START_TIME, COL_ORDER_TIME)
 
 
 @dataclass(frozen=True)
@@ -69,42 +72,92 @@ class RealOrderScenario:
 
     def __init__(
         self,
-        data_path: str,
+        data_path: Optional[str] = None,
         sheet_name: str = "Sheet2",
         arrival_scale: float = 1.0,
         date_filter: str = "dominant_month",
         min_energy_kwh: float = 0.1,
+        daily_dir: Optional[str] = None,
+        sampling_mode: str = "replay",
+        target_orders_per_day: Optional[int] = None,
         lmp_base: float = 0.20,
         lmp_amp: float = 0.10,
         price_freq: float = 3600.0,
         use_order_lmp: bool = False,
+        split: str = "all",
+        train_days: int = 20,
+        validation_days: int = 5,
+        test_days: Optional[int] = None,
         seed: Optional[int] = None,
     ) -> None:
-        self.data_path = str(Path(data_path))
+        self.data_path = str(Path(data_path)) if data_path else None
+        self.daily_dir = str(Path(daily_dir)) if daily_dir else None
         self.sheet_name = sheet_name
         self.arrival_scale = max(float(arrival_scale), 0.0)
         self.date_filter = date_filter
         self.min_energy_kwh = float(min_energy_kwh)
+        self.sampling_mode = str(sampling_mode or "replay").strip().lower()
+        self.target_orders_per_day = (
+            None if target_orders_per_day is None else int(target_orders_per_day)
+        )
         self.lmp_base = float(lmp_base)
         self.lmp_amp = float(lmp_amp)
         self.price_freq = float(price_freq)
         self.use_order_lmp = bool(use_order_lmp)
+        self.split = str(split or "all")
+        self.train_days = int(train_days)
+        self.validation_days = int(validation_days)
+        self.test_days = None if test_days is None else int(test_days)
         self.rng = np.random.default_rng(seed)
 
-        self.dataset = load_real_order_dataset(
-            data_path=self.data_path,
-            sheet_name=self.sheet_name,
-            date_filter=self.date_filter,
-            min_energy_kwh=self.min_energy_kwh,
-        )
+        if self.daily_dir:
+            self.dataset = load_real_order_daily_dataset(
+                daily_dir=self.daily_dir,
+                date_filter=self.date_filter,
+                min_energy_kwh=self.min_energy_kwh,
+            )
+            source_desc = self.daily_dir
+        elif self.data_path:
+            self.dataset = load_real_order_dataset(
+                data_path=self.data_path,
+                sheet_name=self.sheet_name,
+                date_filter=self.date_filter,
+                min_energy_kwh=self.min_energy_kwh,
+            )
+            source_desc = self.data_path
+        else:
+            raise ValueError("RealOrderScenario requires data_path or daily_dir.")
         if not self.dataset.days:
-            raise ValueError(f"No usable real orders loaded from {self.data_path!r}.")
+            raise ValueError(f"No usable real orders loaded from {source_desc!r}.")
+        if self.sampling_mode not in {"replay", "slot_profile_matched"}:
+            raise ValueError(
+                "real_order_sampling_mode must be 'replay' or 'slot_profile_matched'."
+            )
+        if self.sampling_mode == "slot_profile_matched":
+            if self.target_orders_per_day is None or self.target_orders_per_day < 0:
+                raise ValueError(
+                    "slot_profile_matched requires real_order_target_orders_per_day >= 0."
+                )
+        self.days = _select_split_days(
+            days=self.dataset.days,
+            split=self.split,
+            train_days=self.train_days,
+            validation_days=self.validation_days,
+            test_days=self.test_days,
+        )
+        if not self.days:
+            raise ValueError(
+                f"Real-order split {self.split!r} selected no days "
+                f"from {len(self.dataset.days)} available days."
+            )
 
         self.time_seconds = 0.0
         self.last_price_update = -self.price_freq
         self.current_lmp = self.lmp_base
-        self.active_day: date = self.dataset.days[0]
+        self.active_day: date = self.days[0]
+        self._raw_active_records: List[RealOrderRecord] = []
         self._active_records: List[RealOrderRecord] = []
+        self._raw_record_index = 0
         self._record_index = 0
         self._arrival_carry = 0.0
         self._pending_records: List[RealOrderRecord] = []
@@ -113,10 +166,15 @@ class RealOrderScenario:
     def reset(self, seed: Optional[int] = None) -> None:
         if seed is not None:
             self.rng = np.random.default_rng(seed)
-        days = self.dataset.days
+        days = self.days
         day_index = int(seed or 0) % len(days)
         self.active_day = days[day_index]
-        self._active_records = self.dataset.records_by_day[self.active_day]
+        self._raw_active_records = self.dataset.records_by_day[self.active_day]
+        if self.sampling_mode == "slot_profile_matched":
+            self._active_records = self._sample_slot_profile_day(self._raw_active_records)
+        else:
+            self._active_records = list(self._raw_active_records)
+        self._raw_record_index = 0
         self._record_index = 0
         self._arrival_carry = 0.0
         self._pending_records = []
@@ -128,6 +186,15 @@ class RealOrderScenario:
         previous_time = self.time_seconds
         self.time_seconds += float(dt)
 
+        raw_interval_count = 0
+        while self._raw_record_index < len(self._raw_active_records):
+            raw_record = self._raw_active_records[self._raw_record_index]
+            if raw_record.time_s > self.time_seconds:
+                break
+            self._raw_record_index += 1
+            if raw_record.time_s > previous_time or previous_time == 0.0:
+                raw_interval_count += 1
+
         interval_records: List[RealOrderRecord] = []
         while self._record_index < len(self._active_records):
             record = self._active_records[self._record_index]
@@ -137,7 +204,10 @@ class RealOrderScenario:
             if record.time_s > previous_time or previous_time == 0.0:
                 interval_records.append(record)
 
-        self._pending_records = self._scale_interval_records(interval_records)
+        if self.sampling_mode == "slot_profile_matched":
+            self._pending_records = list(interval_records)
+        else:
+            self._pending_records = self._scale_interval_records(interval_records)
 
         if self.time_seconds - self.last_price_update >= self.price_freq:
             self.current_lmp = self.lmp_base + self.lmp_amp * np.sin(
@@ -159,7 +229,12 @@ class RealOrderScenario:
             "t": self.time_seconds,
             "arrivals": len(self._pending_records),
             "real_order_day": self.active_day.isoformat(),
-            "raw_real_order_arrivals": len(interval_records),
+            "real_order_split": self.split,
+            "real_order_sampling_mode": self.sampling_mode,
+            "real_order_target_orders_per_day": self.target_orders_per_day,
+            "real_order_episode_records": len(self._active_records),
+            "raw_real_order_arrivals": raw_interval_count,
+            "scaled_real_order_arrivals": len(self._pending_records),
         }
 
     def pop_order_record(self) -> Optional[RealOrderRecord]:
@@ -189,6 +264,45 @@ class RealOrderScenario:
         scaled.sort(key=lambda r: r.time_s)
         return scaled
 
+    def _sample_slot_profile_day(self, records: List[RealOrderRecord]) -> List[RealOrderRecord]:
+        target = int(self.target_orders_per_day or 0)
+        if target <= 0 or not records:
+            return []
+
+        records_by_slot: Dict[int, List[RealOrderRecord]] = defaultdict(list)
+        for record in records:
+            slot = int(np.clip(int(record.time_s // 900.0), 0, 95))
+            records_by_slot[slot].append(record)
+
+        slots = sorted(records_by_slot)
+        counts = np.asarray([len(records_by_slot[slot]) for slot in slots], dtype=float)
+        weights = counts / max(float(counts.sum()), 1.0)
+        expected = weights * float(target)
+        allocated = np.floor(expected).astype(int)
+        remainder = target - int(allocated.sum())
+        if remainder > 0:
+            order = np.argsort(-(expected - allocated))
+            for idx in order[:remainder]:
+                allocated[int(idx)] += 1
+
+        sampled: List[RealOrderRecord] = []
+        for slot, count in zip(slots, allocated):
+            count_int = int(count)
+            if count_int <= 0:
+                continue
+            slot_records = records_by_slot[slot]
+            if count_int <= len(slot_records):
+                indices = self.rng.choice(len(slot_records), size=count_int, replace=False)
+                sampled.extend(slot_records[int(i)] for i in indices)
+            else:
+                sampled.extend(slot_records)
+                extra = count_int - len(slot_records)
+                extra_indices = self.rng.integers(0, len(slot_records), size=extra)
+                sampled.extend(slot_records[int(i)] for i in extra_indices)
+
+        sampled.sort(key=lambda r: r.time_s)
+        return sampled
+
 
 def load_real_order_dataset(
     data_path: str,
@@ -201,6 +315,21 @@ def load_real_order_dataset(
         _DATASET_CACHE[cache_key] = _load_real_order_dataset_uncached(
             data_path=data_path,
             sheet_name=sheet_name,
+            date_filter=date_filter,
+            min_energy_kwh=min_energy_kwh,
+        )
+    return _DATASET_CACHE[cache_key]
+
+
+def load_real_order_daily_dataset(
+    daily_dir: str,
+    date_filter: str = "dominant_month",
+    min_energy_kwh: float = 0.1,
+) -> RealOrderDataset:
+    cache_key = ("daily_dir", str(Path(daily_dir).resolve()), date_filter, float(min_energy_kwh))
+    if cache_key not in _DATASET_CACHE:
+        _DATASET_CACHE[cache_key] = _load_real_order_daily_dataset_uncached(
+            daily_dir=daily_dir,
             date_filter=date_filter,
             min_energy_kwh=min_energy_kwh,
         )
@@ -227,6 +356,7 @@ def _load_real_order_dataset_uncached(
             raise ValueError(f"Worksheet {sheet_name!r} is empty in {path}") from exc
 
         headers = {str(value): idx for idx, value in enumerate(header_row)}
+        _validate_order_headers(headers, sheet_name=sheet_name, path=path)
         records: List[Tuple[datetime, RealOrderRecord]] = []
         total_rows = 0
 
@@ -239,6 +369,57 @@ def _load_real_order_dataset_uncached(
             )
             if record_pair is not None:
                 records.append(record_pair)
+
+    selected_month = _select_month(records, date_filter)
+    grouped: Dict[date, List[RealOrderRecord]] = defaultdict(list)
+    for started_at, record in records:
+        if selected_month and started_at.strftime("%Y-%m") != selected_month:
+            continue
+        grouped[started_at.date()].append(record)
+
+    records_by_day = {
+        day: sorted(day_records, key=lambda r: r.time_s)
+        for day, day_records in grouped.items()
+        if day_records
+    }
+    usable_records = sum(len(day_records) for day_records in records_by_day.values())
+    return RealOrderDataset(
+        records_by_day=records_by_day,
+        selected_month=selected_month,
+        total_rows=total_rows,
+        usable_records=usable_records,
+    )
+
+
+def _load_real_order_daily_dataset_uncached(
+    daily_dir: str,
+    date_filter: str,
+    min_energy_kwh: float,
+) -> RealOrderDataset:
+    directory = Path(daily_dir)
+    if not directory.exists():
+        raise FileNotFoundError(f"Real order daily directory not found: {directory}")
+    files = sorted(directory.glob("*.csv"))
+    if not files:
+        raise FileNotFoundError(f"No daily CSV files found in: {directory}")
+
+    records: List[Tuple[datetime, RealOrderRecord]] = []
+    total_rows = 0
+    for csv_path in files:
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                continue
+            headers = {name: idx for idx, name in enumerate(reader.fieldnames)}
+            _validate_order_headers(headers, sheet_name=csv_path.name, path=csv_path)
+            for row in reader:
+                total_rows += 1
+                record_pair = _parse_order_dict_row(
+                    row=row,
+                    min_energy_kwh=min_energy_kwh,
+                )
+                if record_pair is not None:
+                    records.append(record_pair)
 
     selected_month = _select_month(records, date_filter)
     grouped: Dict[date, List[RealOrderRecord]] = defaultdict(list)
@@ -312,6 +493,57 @@ def _parse_order_row(
     return started_at, record
 
 
+def _parse_order_dict_row(
+    row: Dict[str, Any],
+    min_energy_kwh: float,
+) -> Optional[Tuple[datetime, RealOrderRecord]]:
+    status = row.get(COL_STATUS)
+    if status not in (None, "", STATUS_DONE):
+        return None
+
+    started_at = _parse_datetime(
+        row.get("real_order_datetime")
+        or row.get(COL_START_TIME)
+        or row.get(COL_ORDER_TIME)
+    )
+    if started_at is None:
+        return None
+
+    energy_kwh = _to_float(row.get(COL_ENERGY_KWH))
+    if energy_kwh is None or energy_kwh < min_energy_kwh:
+        return None
+
+    duration_min = _to_float(row.get(COL_DURATION_MIN))
+    start_soc = _soc_pct_to_frac(_to_float(row.get(COL_START_SOC)))
+    end_soc = _soc_pct_to_frac(_to_float(row.get(COL_END_SOC)))
+    battery_kwh = _estimate_battery_kwh(energy_kwh, start_soc, end_soc)
+
+    time_s = (
+        started_at.hour * 3600.0
+        + started_at.minute * 60.0
+        + started_at.second
+        + started_at.microsecond / 1_000_000.0
+    )
+    record = RealOrderRecord(
+        time_s=float(time_s),
+        energy_kwh=float(energy_kwh),
+        duration_min=duration_min,
+        start_soc=start_soc,
+        end_soc=end_soc,
+        battery_kwh=battery_kwh,
+        pile_power_kw=_to_float(row.get(COL_POWER_KW)),
+        electricity_fee_per_kwh=_fee_per_kwh(
+            _to_float(row.get(COL_ELECTRICITY_FEE)),
+            energy_kwh,
+        ),
+        service_fee_per_kwh=_fee_per_kwh(
+            _to_float(row.get(COL_SERVICE_FEE)),
+            energy_kwh,
+        ),
+    )
+    return started_at, record
+
+
 def _select_month(
     records: Iterable[Tuple[datetime, RealOrderRecord]],
     date_filter: str,
@@ -330,6 +562,56 @@ def _select_month(
     if not month_counts:
         return None
     return month_counts.most_common(1)[0][0]
+
+
+def _select_split_days(
+    days: Sequence[date],
+    split: str,
+    train_days: int,
+    validation_days: int,
+    test_days: Optional[int],
+) -> List[date]:
+    ordered_days = list(days)
+    split_norm = (split or "all").strip().lower()
+    if split_norm in {"", "all", "none"}:
+        return ordered_days
+
+    total_days = len(ordered_days)
+    train_count = max(0, min(int(train_days), total_days))
+    validation_count = max(0, min(int(validation_days), total_days - train_count))
+    remaining_count = max(0, total_days - train_count - validation_count)
+    if test_days is None or int(test_days) <= 0:
+        test_count = remaining_count
+    else:
+        test_count = max(0, min(int(test_days), remaining_count))
+
+    train_split = ordered_days[:train_count]
+    validation_split = ordered_days[train_count: train_count + validation_count]
+    test_split = ordered_days[
+        train_count + validation_count: train_count + validation_count + test_count
+    ]
+
+    if split_norm in {"train", "training"}:
+        return train_split
+    if split_norm in {"validation", "valid", "val"}:
+        return validation_split
+    if split_norm in {"test", "eval", "evaluation"}:
+        return test_split
+    raise ValueError(
+        "real_order_split must be one of 'all', 'train', 'validation', or 'test'."
+    )
+
+
+def _validate_order_headers(headers: Dict[str, int], sheet_name: str, path: Path) -> None:
+    missing = [column for column in REQUIRED_ORDER_COLUMNS if column not in headers]
+    if not any(column in headers for column in TIME_ORDER_COLUMNS):
+        missing.append(f"{COL_START_TIME} or {COL_ORDER_TIME}")
+    if missing:
+        available = ", ".join(str(column) for column in headers.keys())
+        raise ValueError(
+            f"Worksheet {sheet_name!r} in {path} is missing required order "
+            f"columns: {missing}. Available columns: {available}"
+        )
 
 
 def _row_value(row: List[Any], headers: Dict[str, int], column_name: str) -> Any:

@@ -215,7 +215,14 @@ def create_charging_env(config: Dict[str, Any] = None) -> ChargingEnv:
         "real_order_arrival_scale",
         "real_order_date_filter",
         "real_order_min_energy_kwh",
+        "real_order_daily_dir",
+        "real_order_sampling_mode",
+        "real_order_target_orders_per_day",
         "real_order_use_lmp",
+        "real_order_split",
+        "real_order_train_days",
+        "real_order_validation_days",
+        "real_order_test_days",
     ):
         if key in config:
             env_kwargs[key] = config[key]
@@ -238,6 +245,13 @@ def create_charging_env(config: Dict[str, Any] = None) -> ChargingEnv:
         eta=eta,
         **env_kwargs,
     )
+
+
+def _real_order_split_config(env_config: Dict[str, Any] = None, split: str = "all") -> Dict[str, Any]:
+    cfg = dict(env_config or {})
+    if cfg.get("real_order_data_path") or cfg.get("real_order_daily_dir"):
+        cfg["real_order_split"] = split
+    return cfg
 
 
 def fixed_price_by_time(time_s: float) -> float:
@@ -266,7 +280,7 @@ def train_simple(
 ) -> Tuple[ChargingEnv, Dict[str, PricingPolicy], List[float]]:
    
     np.random.seed(seed)
-    env = create_charging_env(env_config)
+    env = create_charging_env(_real_order_split_config(env_config, "train"))
 
     station_ids = [
         aid for aid, agent in env.registered_agents.items()
@@ -382,7 +396,7 @@ def evaluate_policies(
     algo: str = "I-AC-MLP",
 ):
     """Evaluate trained policies without exploration noise."""
-    env = create_charging_env(env_config)
+    env = create_charging_env(_real_order_split_config(env_config, "test"))
     station_ids = [
         aid for aid, agent in env.registered_agents.items()
         if isinstance(agent, StationCoordinator)
@@ -456,7 +470,7 @@ def run_fixed_pricing(
 ):
     """Run the fixed-pricing baseline and export step/episode metrics."""
     env_config = env_config or {}
-    env = create_charging_env(env_config)
+    env = create_charging_env(_real_order_split_config(env_config, "test"))
 
     station_ids = [
         aid for aid, agent in env.registered_agents.items()
@@ -525,7 +539,7 @@ def run_constant_pricing(
 ):
     """Run a constant service-fee policy for smoke diagnostics."""
     env_config = env_config or {}
-    env = create_charging_env(env_config)
+    env = create_charging_env(_real_order_split_config(env_config, "test"))
 
     station_ids = [
         aid for aid, agent in env.registered_agents.items()
@@ -626,6 +640,13 @@ def _append_step_logs(
             "congestion_penalty": metrics["congestion_penalty"],
             "occupied_slots": metrics.get("occupied_slots"),
             "open_slots": metrics.get("open_slots"),
+            "real_order_day": metrics.get("real_order_day"),
+            "real_order_split": metrics.get("real_order_split"),
+            "real_order_sampling_mode": metrics.get("real_order_sampling_mode"),
+            "real_order_target_orders_per_day": metrics.get("real_order_target_orders_per_day"),
+            "real_order_episode_records": metrics.get("real_order_episode_records"),
+            "raw_real_order_arrivals": metrics.get("raw_real_order_arrivals"),
+            "scaled_real_order_arrivals": metrics.get("scaled_real_order_arrivals"),
         })
 
 
@@ -854,6 +875,7 @@ def train_independent_transa3c(
     validation_qvol_weight: float = 300.0,
     validation_network_viol_weight: float = 20.0,
     env_config: Dict[str, Any] = None,
+    device: str | None = None,
     output_dir: str = "outputs/i_transa3c_train",
     algo: str = "I-TransA3C",
 ):
@@ -862,7 +884,7 @@ def train_independent_transa3c(
         raise ImportError("IndependentTransA3CPolicy requires PyTorch. Install torch in the active environment.")
 
     np.random.seed(seed)
-    env = create_charging_env(env_config)
+    env = create_charging_env(_real_order_split_config(env_config, "train"))
 
     station_ids = [
         aid for aid, agent in env.registered_agents.items()
@@ -880,10 +902,13 @@ def train_independent_transa3c(
             critic_lr=5e-4,
             gamma=gamma,
             entropy_coef=0.01,
+            device=device,
             seed=seed + i,
         )
         for i, sid in enumerate(station_ids)
     }
+    policy_device = str(next(iter(policies.values())).device) if policies else str(device)
+    logger.info(f"[{algo}] Policy device: {policy_device}")
 
     step_logs: List[Dict[str, Any]] = []
     episode_logs: List[Dict[str, Any]] = []
@@ -894,7 +919,7 @@ def train_independent_transa3c(
     best_validation_episode = 0
 
     def _run_validation_rollout() -> List[Dict[str, Any]]:
-        val_env = create_charging_env(env_config)
+        val_env = create_charging_env(_real_order_split_config(env_config, "validation"))
         val_step_logs: List[Dict[str, Any]] = []
         for val_episode in range(validation_num_episodes):
             obs, _info = val_env.reset(seed=validation_seed + val_episode)
@@ -986,6 +1011,7 @@ def train_independent_transa3c(
         episode_logs.append({
             "algo": algo,
             "episode": episode,
+            "device": policy_device,
             "total_reward": total,
             **{f"reward_{sid}": episode_reward[sid] for sid in station_ids},
         })
@@ -1028,6 +1054,11 @@ def train_independent_transa3c(
     if best_policy_states is not None:
         for sid in station_ids:
             policies[sid].model.load_state_dict(best_policy_states[sid])
+        if episode_logs:
+            episode_logs[-1].update({
+                "best_validation_episode": best_validation_episode,
+                "best_validation_score": best_validation_score,
+            })
         logger.info(
             f"[{algo}] Restored best validation checkpoint from episode {best_validation_episode} "
             f"(score={best_validation_score:.2f})."
@@ -1052,7 +1083,7 @@ def evaluate_independent_transa3c(
     algo: str = "I-TransA3C",
 ):
     """Evaluate trained I-TransA3C policies deterministically."""
-    env = create_charging_env(env_config)
+    env = create_charging_env(_real_order_split_config(env_config, "test"))
     station_ids = [
         aid for aid, agent in env.registered_agents.items()
         if isinstance(agent, StationCoordinator)
@@ -1152,6 +1183,7 @@ def train_ma_transa3c(
     validation_qvol_weight: float = 300.0,
     validation_network_viol_weight: float = 20.0,
     env_config: Dict[str, Any] = None,
+    device: str | None = None,
     output_dir: str = "outputs/MA_TransA3C_soc_train",
     algo: str = "MA-TransA3C",
 ):
@@ -1162,7 +1194,7 @@ def train_ma_transa3c(
         raise ValueError("use_pressure_obs requires use_ma_station_obs=True.")
 
     np.random.seed(seed)
-    env = create_charging_env(env_config)
+    env = create_charging_env(_real_order_split_config(env_config, "train"))
     station_ids = [
         aid for aid, agent in env.registered_agents.items()
         if isinstance(agent, StationCoordinator)
@@ -1197,8 +1229,10 @@ def train_ma_transa3c(
         use_dual_critic=use_dual_critic,
         dual_critic_w_profit=dual_critic_w_profit,
         dual_critic_w_stability=dual_critic_w_stability,
+        device=device,
         seed=seed,
     )
+    logger.info(f"[{algo}] Policy device: {policy.device}")
 
     step_logs: List[Dict[str, Any]] = []
     episode_logs: List[Dict[str, Any]] = []
@@ -1209,7 +1243,7 @@ def train_ma_transa3c(
     best_validation_episode = 0
 
     def _run_validation_rollout() -> List[Dict[str, Any]]:
-        val_env = create_charging_env(env_config)
+        val_env = create_charging_env(_real_order_split_config(env_config, "validation"))
         val_step_logs: List[Dict[str, Any]] = []
         for val_episode in range(validation_num_episodes):
             obs, _info = val_env.reset(seed=validation_seed + val_episode)
@@ -1448,6 +1482,7 @@ def train_ma_transa3c(
         episode_logs.append({
             "algo": algo,
             "episode": episode,
+            "device": str(policy.device),
             "total_reward": total,
             "actor_loss": update_stats.get("actor_loss"),
             "actor_loss_pg": update_stats.get("actor_loss_pg"),
@@ -1574,7 +1609,7 @@ def evaluate_ma_transa3c(
     """Evaluate MA-TransA3C deterministically."""
     if use_pressure_obs and not use_ma_station_obs:
         raise ValueError("use_pressure_obs requires use_ma_station_obs=True.")
-    env = create_charging_env(env_config)
+    env = create_charging_env(_real_order_split_config(env_config, "test"))
     station_ids = [
         aid for aid, agent in env.registered_agents.items()
         if isinstance(agent, StationCoordinator)
@@ -1691,7 +1726,7 @@ def train_mappo_mlp(
         raise ImportError("MAPPOPolicy requires PyTorch. Install torch in the active environment.")
 
     np.random.seed(seed)
-    env = create_charging_env(env_config)
+    env = create_charging_env(_real_order_split_config(env_config, "train"))
     station_ids = [
         aid for aid, agent in env.registered_agents.items()
         if isinstance(agent, StationCoordinator)
@@ -1723,7 +1758,7 @@ def train_mappo_mlp(
     best_validation_episode = 0
 
     def _run_validation_rollout() -> List[Dict[str, Any]]:
-        val_env = create_charging_env(env_config)
+        val_env = create_charging_env(_real_order_split_config(env_config, "validation"))
         val_step_logs: List[Dict[str, Any]] = []
         for val_episode in range(validation_num_episodes):
             obs, _info = val_env.reset(seed=validation_seed + val_episode)
@@ -1898,7 +1933,7 @@ def evaluate_mappo_mlp(
     algo: str = "MAPPO-MLP",
 ):
     """Evaluate MAPPO-MLP deterministically."""
-    env = create_charging_env(env_config)
+    env = create_charging_env(_real_order_split_config(env_config, "test"))
     station_ids = [
         aid for aid, agent in env.registered_agents.items()
         if isinstance(agent, StationCoordinator)

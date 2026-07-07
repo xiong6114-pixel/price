@@ -35,14 +35,21 @@ def _write_comparison(base: Path, q_threshold: float, ma_eval_dir: str, ma_label
 def run_one(
     name,
     cfg,
+    train_episodes=30,
+    eval_episodes=None,
+    validation_episodes=5,
     real_order_data_path=None,
     real_order_sheet_name="Sheet2",
     real_order_arrival_scale=1.0,
     real_order_date_filter="dominant_month",
     real_order_use_lmp=False,
+    real_order_train_days=20,
+    real_order_validation_days=5,
+    real_order_test_days=6,
 ):
     cfg = dict(cfg)
     base_name = name if str(name).startswith("paper_response_") else f"paper_response_{name}"
+    resolved_eval_episodes = eval_episodes
     if real_order_data_path:
         cfg.update({
             "real_order_data_path": real_order_data_path,
@@ -50,14 +57,22 @@ def run_one(
             "real_order_arrival_scale": real_order_arrival_scale,
             "real_order_date_filter": real_order_date_filter,
             "real_order_use_lmp": real_order_use_lmp,
+            "real_order_train_days": real_order_train_days,
+            "real_order_validation_days": real_order_validation_days,
+            "real_order_test_days": real_order_test_days,
         })
+        if resolved_eval_episodes is None:
+            resolved_eval_episodes = max(int(real_order_test_days), 1)
         scale_tag = "" if abs(float(real_order_arrival_scale) - 1.0) < 1e-9 else f"_scale{real_order_arrival_scale:g}"
-        base_name = f"{base_name}_realorders{scale_tag}"
+        split_tag = f"_split{int(real_order_train_days)}-{int(real_order_validation_days)}-{int(real_order_test_days)}"
+        base_name = f"{base_name}_realorders{scale_tag}{split_tag}"
+    if resolved_eval_episodes is None:
+        resolved_eval_episodes = 1
     base = Path("D:/price/outputs") / base_name
     base.mkdir(parents=True, exist_ok=True)
 
     run_fixed_pricing(
-        num_episodes=1,
+        num_episodes=resolved_eval_episodes,
         steps_per_episode=96,
         seed=2026,
         env_config=cfg,
@@ -65,18 +80,19 @@ def run_one(
     )
 
     _, i_policies, _ = train_independent_transa3c(
-        num_episodes=30,
+        num_episodes=train_episodes,
         steps_per_episode=96,
         seed=42,
         gamma=0.99,
         seq_len=8,
+        validation_num_episodes=validation_episodes,
         env_config=cfg,
         output_dir=str(base / "I_TransA3C_train"),
         algo="I-TransA3C",
     )
     evaluate_independent_transa3c(
         i_policies,
-        num_episodes=1,
+        num_episodes=resolved_eval_episodes,
         steps_per_episode=96,
         seed=2026,
         seq_len=8,
@@ -86,18 +102,19 @@ def run_one(
     )
 
     _, mappo_policy, _ = train_mappo_mlp(
-        num_episodes=30,
+        num_episodes=train_episodes,
         steps_per_episode=96,
         seed=42,
         gamma=0.99,
         use_ma_station_obs=True,
+        validation_num_episodes=validation_episodes,
         env_config=cfg,
         output_dir=str(base / "MAPPO_MLP_train"),
         algo="MAPPO-MLP",
     )
     evaluate_mappo_mlp(
         mappo_policy,
-        num_episodes=1,
+        num_episodes=resolved_eval_episodes,
         steps_per_episode=96,
         seed=2026,
         use_ma_station_obs=True,
@@ -107,7 +124,7 @@ def run_one(
     )
 
     ma_train_kwargs = {
-        "num_episodes": 30,
+        "num_episodes": train_episodes,
         "steps_per_episode": 96,
         "seed": 42,
         "gamma": 0.99,
@@ -117,6 +134,7 @@ def run_one(
         "lambda_rank": 0.20,
         "rank_margin": 0.02,
         "rank_eps": 0.10,
+        "validation_num_episodes": validation_episodes,
         "env_config": cfg,
         "output_dir": str(base / "MA_v3_1b_30ep_train"),
         "algo": "MA-TransA3C-v3.1b-30ep",
@@ -143,7 +161,7 @@ def run_one(
     )
     evaluate_ma_transa3c(
         ma_policy,
-        num_episodes=1,
+        num_episodes=resolved_eval_episodes,
         steps_per_episode=96,
         seed=2026,
         k_neighbors=4,
@@ -172,6 +190,24 @@ def main():
         help="Run only the named response-grid config. Can be repeated.",
     )
     parser.add_argument(
+        "--train-episodes",
+        type=int,
+        default=30,
+        help="Training episodes for each learning baseline.",
+    )
+    parser.add_argument(
+        "--eval-episodes",
+        type=int,
+        default=None,
+        help="Evaluation episodes. Defaults to 1 for simulated data and test days for real orders.",
+    )
+    parser.add_argument(
+        "--validation-episodes",
+        type=int,
+        default=5,
+        help="Validation episodes used for checkpoint selection.",
+    )
+    parser.add_argument(
         "--real-order-data-path",
         default=None,
         help="Optional xlsx order file used to replay real arrivals and EV attributes.",
@@ -197,6 +233,24 @@ def main():
         action="store_true",
         help="Use per-kWh electricity fees from real orders as the LMP signal.",
     )
+    parser.add_argument(
+        "--real-order-train-days",
+        type=int,
+        default=20,
+        help="Number of real-order days assigned to the train split.",
+    )
+    parser.add_argument(
+        "--real-order-validation-days",
+        type=int,
+        default=5,
+        help="Number of real-order days assigned to the validation split.",
+    )
+    parser.add_argument(
+        "--real-order-test-days",
+        type=int,
+        default=6,
+        help="Number of real-order days assigned to the test split.",
+    )
     args = parser.parse_args()
 
     only = set(args.only)
@@ -207,11 +261,17 @@ def main():
         run_one(
             name,
             cfg,
+            train_episodes=args.train_episodes,
+            eval_episodes=args.eval_episodes,
+            validation_episodes=args.validation_episodes,
             real_order_data_path=args.real_order_data_path,
             real_order_sheet_name=args.real_order_sheet_name,
             real_order_arrival_scale=args.real_order_arrival_scale,
             real_order_date_filter=args.real_order_date_filter,
             real_order_use_lmp=args.real_order_use_lmp,
+            real_order_train_days=args.real_order_train_days,
+            real_order_validation_days=args.real_order_validation_days,
+            real_order_test_days=args.real_order_test_days,
         )
 
 
