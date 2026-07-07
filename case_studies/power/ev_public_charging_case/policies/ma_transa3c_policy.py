@@ -1,4 +1,4 @@
-"""Multi-agent Transformer Actor-Critic with shared spatial actor and global critic."""
+"""Multi-agent Transformer Actor-Critic with shared spatial actor and global critics."""
 
 from __future__ import annotations
 
@@ -137,7 +137,7 @@ class GlobalTransformerCritic(nn.Module):
 
 
 class MATransA3CPolicy:
-    """Shared spatial actor with a centralized global critic."""
+    """Shared spatial actor with optional dual centralized critics."""
 
     observation_mode = "neighbor_spatial"
 
@@ -165,6 +165,9 @@ class MATransA3CPolicy:
         response_ema_alpha: float = 0.9,
         lambda_anchor: float = 0.0,
         price_anchor: float = 0.40,
+        use_dual_critic: bool = False,
+        dual_critic_w_profit: float = 1.0,
+        dual_critic_w_stability: float = 0.3,
         seed: int = 42,
         device: str | None = None,
     ):
@@ -185,6 +188,9 @@ class MATransA3CPolicy:
         self.response_ema_alpha = response_ema_alpha
         self.lambda_anchor = lambda_anchor
         self.price_anchor = price_anchor
+        self.use_dual_critic = use_dual_critic
+        self.dual_critic_w_profit = float(dual_critic_w_profit)
+        self.dual_critic_w_stability = float(dual_critic_w_stability)
         self.action_range = (0.0, 0.8)
         self.station_ids = station_ids or [f"station_{i}" for i in range(num_stations)]
         self.station_to_index = {
@@ -207,7 +213,7 @@ class MATransA3CPolicy:
             num_layers=num_layers,
             action_hi=0.8,
         ).to(self.device)
-        self.critic = GlobalTransformerCritic(
+        self.critic_profit = GlobalTransformerCritic(
             obs_dim=obs_dim,
             num_stations=num_stations,
             station_vocab_size=num_stations,
@@ -216,9 +222,26 @@ class MATransA3CPolicy:
             nhead=nhead,
             num_layers=num_layers,
         ).to(self.device)
+        self.critic = self.critic_profit
+        self.critic_stability = (
+            GlobalTransformerCritic(
+                obs_dim=obs_dim,
+                num_stations=num_stations,
+                station_vocab_size=num_stations,
+                station_embed_dim=station_embed_dim,
+                d_model=d_model,
+                nhead=nhead,
+                num_layers=num_layers,
+            ).to(self.device)
+            if use_dual_critic
+            else None
+        )
 
         self.actor_optimizer = torch.optim.AdamW(self.actor.parameters(), lr=actor_lr, weight_decay=1e-4)
-        self.critic_optimizer = torch.optim.AdamW(self.critic.parameters(), lr=critic_lr, weight_decay=1e-4)
+        self._critic_params = list(self.critic_profit.parameters())
+        if self.critic_stability is not None:
+            self._critic_params.extend(self.critic_stability.parameters())
+        self.critic_optimizer = torch.optim.AdamW(self._critic_params, lr=critic_lr, weight_decay=1e-4)
 
     def extract_obs_vector(self, observation, obs_dim: int = 8) -> np.ndarray:
         if isinstance(observation, Observation):
@@ -243,6 +266,75 @@ class MATransA3CPolicy:
         n = min(dim, arr.size)
         out[:n] = arr[:n]
         return out
+
+    @staticmethod
+    def _normalize_advantage(advantage: torch.Tensor) -> torch.Tensor:
+        if advantage.numel() <= 1:
+            return advantage
+        return (advantage - advantage.mean()) / (advantage.std(unbiased=False) + 1e-8)
+
+    def critic_state_dict(self) -> dict:
+        state = {"profit": self.critic_profit.state_dict()}
+        if self.critic_stability is not None:
+            state["stability"] = self.critic_stability.state_dict()
+        return state
+
+    def load_critic_state_dict(self, state: dict) -> None:
+        if "profit" not in state:
+            self.critic_profit.load_state_dict(state)
+            return
+        self.critic_profit.load_state_dict(state["profit"])
+        if self.critic_stability is not None and "stability" in state:
+            self.critic_stability.load_state_dict(state["stability"])
+
+    def training_state_dict(self) -> dict:
+        return {
+            "actor": self.actor.state_dict(),
+            "critic": self.critic_state_dict(),
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+            "dual_critic_w_profit": float(self.dual_critic_w_profit),
+            "dual_critic_w_stability": float(self.dual_critic_w_stability),
+        }
+
+    def load_training_state_dict(self, state: dict, load_optimizers: bool = True) -> None:
+        self.actor.load_state_dict(state["actor"])
+        self.load_critic_state_dict(state["critic"])
+        self.dual_critic_w_profit = float(state.get("dual_critic_w_profit", self.dual_critic_w_profit))
+        self.dual_critic_w_stability = float(state.get("dual_critic_w_stability", self.dual_critic_w_stability))
+        if load_optimizers:
+            if "actor_optimizer" in state:
+                self.actor_optimizer.load_state_dict(state["actor_optimizer"])
+            if "critic_optimizer" in state:
+                self.critic_optimizer.load_state_dict(state["critic_optimizer"])
+
+    def adjust_dual_critic_weights(
+        self,
+        val_qvol: float,
+        val_network_viol: float,
+        target_qvol: float = 4.2785,
+        target_network_viol: float = 880.0,
+    ) -> dict[str, float]:
+        if not self.use_dual_critic:
+            return {}
+
+        old_w_profit = self.dual_critic_w_profit
+        old_w_stability = self.dual_critic_w_stability
+        stability_ok = val_qvol < target_qvol and val_network_viol < target_network_viol
+        if stability_ok:
+            self.dual_critic_w_profit = min(self.dual_critic_w_profit * 1.10, 2.0)
+            self.dual_critic_w_stability = max(self.dual_critic_w_stability * 0.95, 0.15)
+        else:
+            self.dual_critic_w_profit = max(self.dual_critic_w_profit * 0.95, 0.8)
+            self.dual_critic_w_stability = min(self.dual_critic_w_stability * 1.10, 1.0)
+
+        return {
+            "dual_weight_profit_old": float(old_w_profit),
+            "dual_weight_stability_old": float(old_w_stability),
+            "dual_weight_profit": float(self.dual_critic_w_profit),
+            "dual_weight_stability": float(self.dual_critic_w_stability),
+            "dual_weight_stability_ok": 1.0 if stability_ok else 0.0,
+        }
 
     def act(
         self,
@@ -274,11 +366,15 @@ class MATransA3CPolicy:
         global_obs: np.ndarray,
         actions: np.ndarray,
         returns: np.ndarray,
+        profit_returns: np.ndarray | None = None,
+        stability_returns: np.ndarray | None = None,
         rank_global_obs: np.ndarray | None = None,
         rank_valid_mask: np.ndarray | None = None,
     ):
         self.actor.train()
-        self.critic.train()
+        self.critic_profit.train()
+        if self.critic_stability is not None:
+            self.critic_stability.train()
 
         neighbor_t = torch.as_tensor(neighbor_seqs, dtype=torch.float32, device=self.device)
         neighbor_station_t = torch.as_tensor(neighbor_station_indices, dtype=torch.long, device=self.device)
@@ -286,6 +382,16 @@ class MATransA3CPolicy:
         global_t = torch.as_tensor(global_obs, dtype=torch.float32, device=self.device)
         actions_t = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
         returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device).view(-1)
+        profit_returns_t = torch.as_tensor(
+            profit_returns if profit_returns is not None else returns,
+            dtype=torch.float32,
+            device=self.device,
+        ).view(-1)
+        stability_returns_t = torch.as_tensor(
+            stability_returns if stability_returns is not None else returns,
+            dtype=torch.float32,
+            device=self.device,
+        ).view(-1)
         rank_global_t = (
             torch.as_tensor(rank_global_obs, dtype=torch.float32, device=self.device)
             if rank_global_obs is not None
@@ -315,10 +421,24 @@ class MATransA3CPolicy:
         entropy = dist.entropy().mean()
 
         critic_station_idx = torch.as_tensor(self.global_station_indices, dtype=torch.long, device=self.device).view(1, self.num_stations).expand(steps, -1)
-        values = self.critic(global_t, critic_station_idx)
-        advantages = returns_t - values.detach()
-        if advantages.numel() > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+        profit_values = self.critic_profit(global_t, critic_station_idx)
+        critic_loss_stability = torch.zeros((), dtype=torch.float32, device=self.device)
+        if self.use_dual_critic and self.critic_stability is not None:
+            stability_values = self.critic_stability(global_t, critic_station_idx)
+            profit_advantages = self._normalize_advantage(profit_returns_t - profit_values.detach())
+            stability_advantages = self._normalize_advantage(stability_returns_t - stability_values.detach())
+            advantages = (
+                self.dual_critic_w_profit * profit_advantages
+                + self.dual_critic_w_stability * stability_advantages
+            )
+            advantages = self._normalize_advantage(advantages)
+            critic_loss_profit = F.mse_loss(profit_values, profit_returns_t)
+            critic_loss_stability = F.mse_loss(stability_values, stability_returns_t)
+            critic_loss = critic_loss_profit + critic_loss_stability
+        else:
+            advantages = self._normalize_advantage(returns_t - profit_values.detach())
+            critic_loss_profit = F.mse_loss(profit_values, returns_t)
+            critic_loss = critic_loss_profit
         global_adv = advantages.unsqueeze(1).expand(-1, num_stations)
 
         actor_loss_pg = -(log_probs * global_adv).mean() - self.entropy_coef * entropy
@@ -393,8 +513,6 @@ class MATransA3CPolicy:
             + self.lambda_response * response_loss
             + self.lambda_anchor * anchor_loss
         )
-        critic_loss = F.mse_loss(values, returns_t)
-
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
@@ -402,13 +520,17 @@ class MATransA3CPolicy:
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(self._critic_params, 1.0)
         self.critic_optimizer.step()
 
         return {
             "actor_loss": float(actor_loss.item()),
             "actor_loss_pg": float(actor_loss_pg.item()),
             "critic_loss": float(critic_loss.item()),
+            "critic_profit_loss": float(critic_loss_profit.item()),
+            "critic_stability_loss": float(critic_loss_stability.item()),
+            "dual_weight_profit": float(self.dual_critic_w_profit),
+            "dual_weight_stability": float(self.dual_critic_w_stability),
             "entropy": float(entropy.item()),
             "actor_mean_price": float(mean_matrix.detach().mean().item()),
             "rank_loss": float(rank_loss.item()),

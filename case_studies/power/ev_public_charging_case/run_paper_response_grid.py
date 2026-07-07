@@ -32,8 +32,27 @@ def _write_comparison(base: Path, q_threshold: float, ma_eval_dir: str, ma_label
     write_csv(base / "paper_table2_reproduction.csv", add_relative_metrics(rows, fp_algo_name="FP"))
 
 
-def run_one(name, cfg):
+def run_one(
+    name,
+    cfg,
+    real_order_data_path=None,
+    real_order_sheet_name="Sheet2",
+    real_order_arrival_scale=1.0,
+    real_order_date_filter="dominant_month",
+    real_order_use_lmp=False,
+):
+    cfg = dict(cfg)
     base_name = name if str(name).startswith("paper_response_") else f"paper_response_{name}"
+    if real_order_data_path:
+        cfg.update({
+            "real_order_data_path": real_order_data_path,
+            "real_order_sheet_name": real_order_sheet_name,
+            "real_order_arrival_scale": real_order_arrival_scale,
+            "real_order_date_filter": real_order_date_filter,
+            "real_order_use_lmp": real_order_use_lmp,
+        })
+        scale_tag = "" if abs(float(real_order_arrival_scale) - 1.0) < 1e-9 else f"_scale{real_order_arrival_scale:g}"
+        base_name = f"{base_name}_realorders{scale_tag}"
     base = Path("D:/price/outputs") / base_name
     base.mkdir(parents=True, exist_ok=True)
 
@@ -108,13 +127,16 @@ def run_one(name, cfg):
     if name == "paper_response_F_p30_arr50_eta4":
         ma_train_kwargs.update({
             "use_lagged_rank_loss": True,
-            "lambda_anchor": 0.04,
-            "price_anchor": 0.46,
-            "output_dir": str(base / "MA_v6a_anchor46_eta4_train"),
-            "algo": "MA-TransA3C-v6a-anchor46-eta4",
+            "lambda_anchor": 0.20,
+            "price_anchor": 0.60,
+            "use_dual_critic": False,
+            "use_pressure_obs": True,
+            "pressure_ema_alpha": 0.8,
+            "output_dir": str(base / "MA_v8b0_pressureobs_only_train"),
+            "algo": "MA-TransA3C-v8b0-pressureobs-only",
         })
-        ma_eval_dir = "MA_v6a_anchor46_eta4_eval"
-        ma_algo = "MA-TransA3C-v6a-anchor46-eta4"
+        ma_eval_dir = "MA_v8b0_pressureobs_only_eval"
+        ma_algo = "MA-TransA3C-v8b0-pressureobs-only"
 
     _, ma_policy, _ = train_ma_transa3c(
         **ma_train_kwargs,
@@ -126,6 +148,8 @@ def run_one(name, cfg):
         seed=2026,
         k_neighbors=4,
         use_ma_station_obs=True,
+        use_pressure_obs=ma_train_kwargs.get("use_pressure_obs", False),
+        pressure_ema_alpha=ma_train_kwargs.get("pressure_ema_alpha", 0.8),
         env_config=cfg,
         output_dir=str(base / ma_eval_dir),
         algo=ma_algo,
@@ -147,6 +171,32 @@ def main():
         default=[],
         help="Run only the named response-grid config. Can be repeated.",
     )
+    parser.add_argument(
+        "--real-order-data-path",
+        default=None,
+        help="Optional xlsx order file used to replay real arrivals and EV attributes.",
+    )
+    parser.add_argument(
+        "--real-order-sheet-name",
+        default="Sheet2",
+        help="Worksheet containing order-level rows.",
+    )
+    parser.add_argument(
+        "--real-order-arrival-scale",
+        type=float,
+        default=1.0,
+        help="Scale real arrival counts before injecting them into the simulator.",
+    )
+    parser.add_argument(
+        "--real-order-date-filter",
+        default="dominant_month",
+        help="Use 'dominant_month', 'all', or a YYYY-MM month from the xlsx.",
+    )
+    parser.add_argument(
+        "--real-order-use-lmp",
+        action="store_true",
+        help="Use per-kWh electricity fees from real orders as the LMP signal.",
+    )
     args = parser.parse_args()
 
     only = set(args.only)
@@ -154,7 +204,15 @@ def main():
         if only and name not in only:
             continue
         print(f"\n===== RUN {name} =====")
-        run_one(name, cfg)
+        run_one(
+            name,
+            cfg,
+            real_order_data_path=args.real_order_data_path,
+            real_order_sheet_name=args.real_order_sheet_name,
+            real_order_arrival_scale=args.real_order_arrival_scale,
+            real_order_date_filter=args.real_order_date_filter,
+            real_order_use_lmp=args.real_order_use_lmp,
+        )
 
 
 if __name__ == "__main__":

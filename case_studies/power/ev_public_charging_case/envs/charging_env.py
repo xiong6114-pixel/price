@@ -10,6 +10,7 @@ from heron.utils.typing import AgentID, MultiAgentDict
 
 from case_studies.power.ev_public_charging_case.envs.common import EVRequest, EnvState, SlotState, StationStepMetrics
 from case_studies.power.ev_public_charging_case.envs.market_scenario import MarketScenario
+from case_studies.power.ev_public_charging_case.envs.real_order_scenario import RealOrderScenario
 from case_studies.power.ev_public_charging_case.envs.regulation_scenario import RegulationScenario
 
 
@@ -52,6 +53,12 @@ class ChargingEnv(HeronEnv):
         self.charge_lmp_weight = float(kwargs.get("charge_lmp_weight", 1.0))
         self.enable_in_session_price_response = bool(kwargs.get("enable_in_session_price_response", True))
         self.min_charge_power_frac = float(kwargs.get("min_charge_power_frac", 0.25))
+        self.real_order_data_path = kwargs.get("real_order_data_path", None)
+        self.real_order_sheet_name = str(kwargs.get("real_order_sheet_name", "Sheet2"))
+        self.real_order_arrival_scale = float(kwargs.get("real_order_arrival_scale", 1.0))
+        self.real_order_date_filter = str(kwargs.get("real_order_date_filter", "dominant_month"))
+        self.real_order_min_energy_kwh = float(kwargs.get("real_order_min_energy_kwh", 0.1))
+        self.real_order_use_lmp = bool(kwargs.get("real_order_use_lmp", False))
 
         self._time_s = 0.0
 
@@ -59,13 +66,7 @@ class ChargingEnv(HeronEnv):
         self._rng = np.random.default_rng(seed)
 
         # External scenarios
-        self.scenario = MarketScenario(
-            self._arrival_rate,
-            3600.0,
-            lmp_base=self.lmp_base,
-            lmp_amp=self.lmp_amp,
-            rng=self._rng,
-        )
+        self.scenario = self._build_market_scenario(seed=seed)
         self.reg_scenario = RegulationScenario(reg_freq=reg_freq, alpha=reg_alpha, seed=seed or 0)
         self._latest_station_metrics: Dict[str, Dict[str, Any]] = {}
         self._latest_reg_metrics: Dict[str, Any] = {}
@@ -125,6 +126,28 @@ class ChargingEnv(HeronEnv):
             **kwargs,
         )
 
+    def _build_market_scenario(self, seed: Optional[int] = None):
+        if self.real_order_data_path:
+            return RealOrderScenario(
+                data_path=str(self.real_order_data_path),
+                sheet_name=self.real_order_sheet_name,
+                arrival_scale=self.real_order_arrival_scale,
+                date_filter=self.real_order_date_filter,
+                min_energy_kwh=self.real_order_min_energy_kwh,
+                lmp_base=self.lmp_base,
+                lmp_amp=self.lmp_amp,
+                price_freq=3600.0,
+                use_order_lmp=self.real_order_use_lmp,
+                seed=seed,
+            )
+        return MarketScenario(
+            self._arrival_rate,
+            3600.0,
+            lmp_base=self.lmp_base,
+            lmp_amp=self.lmp_amp,
+            rng=self._rng,
+        )
+
     # ============================================
     # Lifecycle overrides
     # ============================================
@@ -134,13 +157,7 @@ class ChargingEnv(HeronEnv):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
-        self.scenario = MarketScenario(
-            self._arrival_rate,
-            3600.0,
-            lmp_base=self.lmp_base,
-            lmp_amp=self.lmp_amp,
-            rng=self._rng,
-        )
+        self.scenario = self._build_market_scenario(seed=seed)
         # reset regulation scenario clock too
         self.reg_scenario = RegulationScenario(
             reg_freq=self.reg_scenario.reg_freq,
@@ -265,6 +282,41 @@ class ChargingEnv(HeronEnv):
             base_x, base_y = self.station_positions.get(station_id, (0.0, 0.0))
             origin_x = float(base_x + self._rng.normal(0.0, self.edge_sigma))
             origin_y = float(base_y + self._rng.normal(0.0, self.edge_sigma))
+
+        pop_order_record = getattr(self.scenario, "pop_order_record", None)
+        order_record = pop_order_record() if callable(pop_order_record) else None
+        if order_record is not None:
+            soc = getattr(order_record, "start_soc", None)
+            soc_target = getattr(order_record, "end_soc", None)
+            battery_kwh = getattr(order_record, "battery_kwh", None)
+            energy_kwh = max(float(getattr(order_record, "energy_kwh", 0.0)), 0.0)
+
+            if soc is None:
+                soc = float(self._rng.uniform(0.1, 0.35))
+            if soc_target is None or soc_target <= soc + 0.02:
+                soc_target = float(np.clip(soc + self._rng.uniform(0.35, 0.65), 0.75, 0.98))
+            if battery_kwh is None:
+                soc_delta = max(float(soc_target) - float(soc), 0.05)
+                inferred_battery = energy_kwh / soc_delta if energy_kwh > 0.0 else self._rng.uniform(55.0, 90.0)
+                battery_kwh = float(np.clip(inferred_battery, 35.0, 150.0))
+
+            duration_min = getattr(order_record, "duration_min", None)
+            if duration_min is None or duration_min <= 0.0:
+                max_wait_time = float(self._rng.uniform(1800.0, 5400.0))
+            else:
+                max_wait_time = float(np.clip(duration_min * 60.0 + 900.0, 1800.0, 21600.0))
+
+            return EVRequest(
+                origin_x=origin_x,
+                origin_y=origin_y,
+                soc=float(np.clip(soc, 0.0, 0.98)),
+                soc_target=float(np.clip(soc_target, 0.05, 1.0)),
+                battery_kwh=float(battery_kwh),
+                km_per_kwh=float(self._rng.uniform(5.0, 7.0)),
+                price_sensitivity=float(self._rng.uniform(0.2, 0.8)),
+                arrival_time=float(time_s),
+                max_wait_time=max_wait_time,
+            )
 
         return EVRequest(
             origin_x=origin_x,

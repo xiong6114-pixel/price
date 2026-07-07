@@ -209,6 +209,16 @@ def create_charging_env(config: Dict[str, Any] = None) -> ChargingEnv:
         "min_charge_power_frac": config.get("min_charge_power_frac", 0.25),
         "station_positions": config.get("station_positions"),
     }
+    for key in (
+        "real_order_data_path",
+        "real_order_sheet_name",
+        "real_order_arrival_scale",
+        "real_order_date_filter",
+        "real_order_min_energy_kwh",
+        "real_order_use_lmp",
+    ):
+        if key in config:
+            env_kwargs[key] = config[key]
 
     coordinators: List[StationCoordinator] = []
     for i in range(num_stations):
@@ -659,9 +669,15 @@ def build_ma_station_obs_matrix(
     raw_obs_vecs: Dict[str, np.ndarray],
     station_metrics: Dict[str, Dict[str, Any]],
     env_config: Dict[str, Any] | None = None,
+    neighbor_index: Dict[str, List[str]] | None = None,
+    use_pressure_obs: bool = False,
+    arrival_ema: Dict[str, float] | None = None,
+    prev_queue_len: Dict[str, float] | None = None,
+    prev_prev_queue_len: Dict[str, float] | None = None,
 ) -> Dict[str, np.ndarray]:
     """Build MA-specific station observations with explicit congestion features."""
     env_config = env_config or {}
+    station_metrics = station_metrics or {}
     max_queue_size = float(env_config.get("max_queue_size", 12))
     q_threshold = float(env_config.get("q_threshold", 4.0))
     eta = float(env_config.get("eta", 1.0))
@@ -705,7 +721,81 @@ def build_ma_station_obs_matrix(
             ],
             dtype=np.float32,
         )
-    return ma_obs
+    if not use_pressure_obs:
+        return ma_obs
+
+    all_prev_queues = [
+        float(station_metrics.get(sid, {}).get("queue_len", 0.0))
+        for sid in station_ids
+    ]
+    network_max_queue = max(all_prev_queues) if all_prev_queues else 0.0
+    network_pressure = np.clip(network_max_queue / max(q_threshold, 1e-6), 0.0, 2.0) / 2.0
+    enhanced = {}
+    arrival_ema = arrival_ema or {}
+    prev_queue_len = prev_queue_len or {}
+    prev_prev_queue_len = prev_prev_queue_len or {}
+
+    for sid in station_ids:
+        metrics = station_metrics.get(sid, {})
+        q_now = float(metrics.get("queue_len", prev_queue_len.get(sid, 0.0)))
+        q_prev = float(prev_prev_queue_len.get(sid, 0.0))
+        arr_ema = float(arrival_ema.get(sid, 0.0))
+        arr_feat = np.clip(arr_ema / 5.0, 0.0, 2.0) / 2.0
+        q_delta = (q_now - q_prev) / max(q_threshold, 1e-6)
+        q_delta_feat = np.clip(q_delta, -1.0, 1.0)
+
+        neighbors = neighbor_index.get(sid, []) if neighbor_index else []
+        neighbor_free_values = []
+        for nid in neighbors:
+            if nid == sid:
+                continue
+            n_metrics = station_metrics.get(nid, {})
+            util = float(n_metrics.get("utilization", 0.0))
+            neighbor_free_values.append(max(0.0, 1.0 - util))
+        neighbor_free_capacity = (
+            float(np.mean(neighbor_free_values))
+            if neighbor_free_values
+            else 0.0
+        )
+        pressure_feats = np.asarray(
+            [
+                arr_feat,
+                q_delta_feat,
+                neighbor_free_capacity,
+                network_pressure,
+            ],
+            dtype=np.float32,
+        )
+        enhanced[sid] = np.concatenate([ma_obs[sid].astype(np.float32), pressure_feats], axis=0)
+    return enhanced
+
+
+def _init_pressure_obs_state(station_ids: List[str]) -> tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
+    return (
+        {sid: 0.0 for sid in station_ids},
+        {sid: 0.0 for sid in station_ids},
+        {sid: 0.0 for sid in station_ids},
+    )
+
+
+def _update_pressure_obs_state(
+    station_ids: List[str],
+    station_metrics: Dict[str, Dict[str, Any]],
+    arrival_ema: Dict[str, float],
+    prev_queue_len: Dict[str, float],
+    prev_prev_queue_len: Dict[str, float],
+    pressure_ema_alpha: float,
+) -> None:
+    for sid in station_ids:
+        metrics = station_metrics.get(sid, {})
+        arrivals = float(metrics.get("arrivals", 0.0))
+        queue_len = float(metrics.get("queue_len", 0.0))
+        arrival_ema[sid] = (
+            pressure_ema_alpha * float(arrival_ema.get(sid, 0.0))
+            + (1.0 - pressure_ema_alpha) * arrivals
+        )
+        prev_prev_queue_len[sid] = float(prev_queue_len.get(sid, 0.0))
+        prev_queue_len[sid] = queue_len
 
 
 def _summarize_validation_step_logs(
@@ -1048,6 +1138,14 @@ def train_ma_transa3c(
     price_anchor: float = 0.40,
     lambda_network_excess: float = 0.0,
     lambda_network_flag: float = 0.0,
+    use_dual_critic: bool = False,
+    dual_critic_w_profit: float = 1.0,
+    dual_critic_w_stability: float = 0.3,
+    dual_critic_target_qvol: float = 4.2785,
+    dual_critic_target_network_viol: float = 880.0,
+    use_pressure_obs: bool = False,
+    pressure_ema_alpha: float = 0.8,
+    lambda_shunt: float = 0.0,
     validation_every: int = 5,
     validation_num_episodes: int = 5,
     validation_seed: int = 3000,
@@ -1060,6 +1158,8 @@ def train_ma_transa3c(
     """Train shared spatial actor with centralized global critic."""
     if MATransA3CPolicy is None:
         raise ImportError("MATransA3CPolicy requires PyTorch. Install torch in the active environment.")
+    if use_pressure_obs and not use_ma_station_obs:
+        raise ValueError("use_pressure_obs requires use_ma_station_obs=True.")
 
     np.random.seed(seed)
     env = create_charging_env(env_config)
@@ -1069,9 +1169,12 @@ def train_ma_transa3c(
     ]
     neighbor_index = build_neighbor_index(station_ids, env.station_positions, k_neighbors=k_neighbors)
     neighbor_station_arrays, center_station_indices = build_neighbor_station_index_arrays(station_ids, neighbor_index)
+    obs_dim = 10 if use_ma_station_obs else 8
+    if use_pressure_obs:
+        obs_dim += 4
 
     policy = MATransA3CPolicy(
-        obs_dim=10 if use_ma_station_obs else 8,
+        obs_dim=obs_dim,
         seq_len=min(k_neighbors + 1, len(station_ids)),
         num_stations=len(station_ids),
         station_ids=station_ids,
@@ -1091,6 +1194,9 @@ def train_ma_transa3c(
         response_ema_alpha=response_ema_alpha,
         lambda_anchor=lambda_anchor,
         price_anchor=price_anchor,
+        use_dual_critic=use_dual_critic,
+        dual_critic_w_profit=dual_critic_w_profit,
+        dual_critic_w_stability=dual_critic_w_stability,
         seed=seed,
     )
 
@@ -1098,8 +1204,7 @@ def train_ma_transa3c(
     episode_logs: List[Dict[str, Any]] = []
     returns_history: List[float] = []
     q_threshold = float((env_config or {}).get("q_threshold", 4.0))
-    best_actor_state = None
-    best_critic_state = None
+    best_policy_state = None
     best_validation_score = float("-inf")
     best_validation_episode = 0
 
@@ -1109,13 +1214,24 @@ def train_ma_transa3c(
         for val_episode in range(validation_num_episodes):
             obs, _info = val_env.reset(seed=validation_seed + val_episode)
             prev_station_metrics: Dict[str, Dict[str, Any]] = {}
+            arrival_ema, prev_queue_len, prev_prev_queue_len = _init_pressure_obs_state(station_ids)
             for step in range(steps_per_episode):
                 raw_obs_vecs = {}
                 for sid in station_ids:
                     observation = _extract_obs_vector(obs[sid], step, obs_dim=8)
                     raw_obs_vecs[sid] = policy.extract_obs_vector(observation, 8)
                 obs_vecs = (
-                    build_ma_station_obs_matrix(station_ids, raw_obs_vecs, prev_station_metrics, env_config)
+                    build_ma_station_obs_matrix(
+                        station_ids,
+                        raw_obs_vecs,
+                        prev_station_metrics,
+                        env_config,
+                        neighbor_index=neighbor_index,
+                        use_pressure_obs=use_pressure_obs,
+                        arrival_ema=arrival_ema,
+                        prev_queue_len=prev_queue_len,
+                        prev_prev_queue_len=prev_prev_queue_len,
+                    )
                     if use_ma_station_obs
                     else raw_obs_vecs
                 )
@@ -1131,6 +1247,15 @@ def train_ma_transa3c(
                     actions[sid] = make_price_action(float(action_arr[0]))
                 obs, _rewards, terminated, truncated, infos = val_env.step(actions)
                 station_metrics = infos.get("__all__", {}).get("station_metrics", {})
+                if use_pressure_obs:
+                    _update_pressure_obs_state(
+                        station_ids,
+                        station_metrics,
+                        arrival_ema,
+                        prev_queue_len,
+                        prev_prev_queue_len,
+                        pressure_ema_alpha,
+                    )
                 prev_station_metrics = station_metrics
                 _append_step_logs(val_step_logs, station_metrics, algo, val_episode, step)
                 if terminated.get("__all__", False) or truncated.get("__all__", False):
@@ -1141,6 +1266,7 @@ def train_ma_transa3c(
         obs, info = env.reset(seed=seed + episode)
         episode_reward = {sid: 0.0 for sid in station_ids}
         prev_station_metrics: Dict[str, Dict[str, Any]] = {}
+        arrival_ema, prev_queue_len, prev_prev_queue_len = _init_pressure_obs_state(station_ids)
         update_stats: Dict[str, float] = {}
         traj_neighbor_seqs = []
         traj_neighbor_station_indices = []
@@ -1150,12 +1276,15 @@ def train_ma_transa3c(
         traj_rank_valid_mask = []
         traj_actions = []
         traj_global_rewards = []
+        traj_profit_rewards = []
+        traj_stability_rewards = []
         prev_rank_global_obs = None
         episode_network_max_queues = []
         episode_network_excess = []
         episode_network_flags = []
         network_excess_penalty_total = 0.0
         network_flag_penalty_total = 0.0
+        shunt_bonus_total = 0.0
 
         for step in range(steps_per_episode):
             raw_obs_vecs = {}
@@ -1164,7 +1293,17 @@ def train_ma_transa3c(
                 raw_obs_vecs[sid] = policy.extract_obs_vector(observation, 8)
 
             obs_vecs = (
-                build_ma_station_obs_matrix(station_ids, raw_obs_vecs, prev_station_metrics, env_config)
+                build_ma_station_obs_matrix(
+                    station_ids,
+                    raw_obs_vecs,
+                    prev_station_metrics,
+                    env_config,
+                    neighbor_index=neighbor_index,
+                    use_pressure_obs=use_pressure_obs,
+                    arrival_ema=arrival_ema,
+                    prev_queue_len=prev_queue_len,
+                    prev_prev_queue_len=prev_prev_queue_len,
+                )
                 if use_ma_station_obs
                 else raw_obs_vecs
             )
@@ -1201,6 +1340,15 @@ def train_ma_transa3c(
 
             obs, rewards, terminated, truncated, infos = env.step(actions)
             station_metrics = infos.get("__all__", {}).get("station_metrics", {})
+            if use_pressure_obs:
+                _update_pressure_obs_state(
+                    station_ids,
+                    station_metrics,
+                    arrival_ema,
+                    prev_queue_len,
+                    prev_prev_queue_len,
+                    pressure_ema_alpha,
+                )
             prev_station_metrics = station_metrics
             global_reward = 0.0
 
@@ -1208,6 +1356,26 @@ def train_ma_transa3c(
                 reward_value = float(rewards.get(sid, 0.0))
                 episode_reward[sid] += reward_value
                 global_reward += reward_value
+
+            if station_metrics:
+                global_profit_reward = sum(
+                    float(metrics.get("profit", 0.0))
+                    for metrics in station_metrics.values()
+                )
+            else:
+                global_profit_reward = global_reward
+
+            shunt_bonus = 0.0
+            if lambda_shunt > 0.0 and station_metrics:
+                utils = [
+                    float(metrics.get("utilization", 0.0))
+                    for metrics in station_metrics.values()
+                ]
+                util_std = float(np.std(utils)) if len(utils) > 1 else 0.0
+                balanced_util = max(0.0, 1.0 - util_std)
+                shunt_bonus = lambda_shunt * max(global_profit_reward, 0.0) * balanced_util
+                global_reward += shunt_bonus
+                shunt_bonus_total += shunt_bonus
 
             if station_metrics:
                 network_max_queue = max(
@@ -1218,6 +1386,7 @@ def train_ma_transa3c(
                 network_max_queue = 0.0
             network_excess = max(0.0, network_max_queue - q_threshold)
             network_flag = 1.0 if network_excess > 0.0 else 0.0
+            stability_reward = -(network_excess + network_flag)
             network_excess_penalty = lambda_network_excess * network_excess
             network_flag_penalty = lambda_network_flag * network_flag
             global_reward -= network_excess_penalty + network_flag_penalty
@@ -1235,6 +1404,8 @@ def train_ma_transa3c(
             traj_rank_valid_mask.append(rank_valid)
             traj_actions.append(np.asarray(action_values, dtype=np.float32))
             traj_global_rewards.append(global_reward)
+            traj_profit_rewards.append(global_profit_reward)
+            traj_stability_rewards.append(stability_reward)
             prev_rank_global_obs = global_obs
 
             _append_step_logs(step_logs, station_metrics, algo, episode, step)
@@ -1247,6 +1418,16 @@ def train_ma_transa3c(
         for reward_value in reversed(traj_global_rewards):
             G = reward_value + gamma * G
             returns.insert(0, G)
+        profit_returns = []
+        G_profit = 0.0
+        for reward_value in reversed(traj_profit_rewards):
+            G_profit = reward_value + gamma * G_profit
+            profit_returns.insert(0, G_profit)
+        stability_returns = []
+        G_stability = 0.0
+        for reward_value in reversed(traj_stability_rewards):
+            G_stability = reward_value + gamma * G_stability
+            stability_returns.insert(0, G_stability)
 
         if returns:
             update_stats = policy.update(
@@ -1256,6 +1437,8 @@ def train_ma_transa3c(
                 global_obs=np.asarray(traj_global_obs, dtype=np.float32),
                 actions=np.asarray(traj_actions, dtype=np.float32),
                 returns=np.asarray(returns, dtype=np.float32),
+                profit_returns=np.asarray(profit_returns, dtype=np.float32),
+                stability_returns=np.asarray(stability_returns, dtype=np.float32),
                 rank_global_obs=np.asarray(traj_rank_global_obs, dtype=np.float32),
                 rank_valid_mask=np.asarray(traj_rank_valid_mask, dtype=bool),
             )
@@ -1269,6 +1452,10 @@ def train_ma_transa3c(
             "actor_loss": update_stats.get("actor_loss"),
             "actor_loss_pg": update_stats.get("actor_loss_pg"),
             "critic_loss": update_stats.get("critic_loss"),
+            "critic_profit_loss": update_stats.get("critic_profit_loss"),
+            "critic_stability_loss": update_stats.get("critic_stability_loss"),
+            "dual_weight_profit": update_stats.get("dual_weight_profit"),
+            "dual_weight_stability": update_stats.get("dual_weight_stability"),
             "entropy": update_stats.get("entropy"),
             "actor_mean_price": update_stats.get("actor_mean_price"),
             "rank_loss": update_stats.get("rank_loss"),
@@ -1293,6 +1480,8 @@ def train_ma_transa3c(
             "network_violation_steps": sum(episode_network_flags),
             "network_excess_penalty_total": network_excess_penalty_total,
             "network_flag_penalty_total": network_flag_penalty_total,
+            "lambda_shunt": lambda_shunt,
+            "shunt_bonus_total": shunt_bonus_total,
             **{f"reward_{sid}": episode_reward[sid] for sid in station_ids},
         })
         if validation_num_episodes > 0 and validation_every > 0 and (episode + 1) % validation_every == 0:
@@ -1307,20 +1496,35 @@ def train_ma_transa3c(
             if is_best:
                 best_validation_score = val_score
                 best_validation_episode = episode + 1
-                best_actor_state = deepcopy(policy.actor.state_dict())
-                best_critic_state = deepcopy(policy.critic.state_dict())
+                best_policy_state = deepcopy(policy.training_state_dict())
+            dual_weight_stats = {}
+            if use_dual_critic:
+                dual_weight_stats = policy.adjust_dual_critic_weights(
+                    val_qvol=val_summary["queue_volatility"],
+                    val_network_viol=val_summary["avg_network_queue_violation_count"],
+                    target_qvol=dual_critic_target_qvol,
+                    target_network_viol=dual_critic_target_network_viol,
+                )
             episode_logs[-1].update({
                 "validation_score": val_score,
                 "validation_profit": val_summary["avg_daily_profit"],
                 "validation_queue_volatility": val_summary["queue_volatility"],
                 "validation_network_queue_violation_count": val_summary["avg_network_queue_violation_count"],
                 "selected_checkpoint": 1 if is_best else 0,
+                **dual_weight_stats,
             })
+            dual_weight_msg = (
+                f" w_profit={policy.dual_critic_w_profit:.3f} "
+                f"w_stability={policy.dual_critic_w_stability:.3f}"
+                if use_dual_critic
+                else ""
+            )
             logger.info(
                 f"[{algo}] Validation @ ep {episode + 1:3d} | "
                 f"score={val_score:.2f} profit={val_summary['avg_daily_profit']:.2f} "
                 f"qvol={val_summary['queue_volatility']:.4f} "
                 f"net_viol/ep={val_summary['avg_network_queue_violation_count']:.2f}"
+                f"{dual_weight_msg}"
             )
         logger.info(
             f"[{algo}] Episode {episode + 1:3d} | "
@@ -1331,12 +1535,20 @@ def train_ma_transa3c(
             f"Per-station: {dict((k, round(v, 2)) for k, v in episode_reward.items())}"
         )
 
-    if best_actor_state is not None and best_critic_state is not None:
-        policy.actor.load_state_dict(best_actor_state)
-        policy.critic.load_state_dict(best_critic_state)
+    if best_policy_state is not None:
+        policy.load_training_state_dict(best_policy_state)
+        if episode_logs:
+            episode_logs[-1].update({
+                "best_validation_episode": best_validation_episode,
+                "best_validation_score": best_validation_score,
+                "restored_dual_weight_profit": policy.dual_critic_w_profit,
+                "restored_dual_weight_stability": policy.dual_critic_w_stability,
+            })
         logger.info(
             f"[{algo}] Restored best validation checkpoint from episode {best_validation_episode} "
-            f"(score={best_validation_score:.2f})."
+            f"(score={best_validation_score:.2f}, "
+            f"w_profit={policy.dual_critic_w_profit:.3f}, "
+            f"w_stability={policy.dual_critic_w_stability:.3f})."
         )
 
     out_dir = Path(output_dir)
@@ -1353,11 +1565,15 @@ def evaluate_ma_transa3c(
     seed: int = 2026,
     k_neighbors: int = 4,
     use_ma_station_obs: bool = False,
+    use_pressure_obs: bool = False,
+    pressure_ema_alpha: float = 0.8,
     env_config: Dict[str, Any] = None,
     output_dir: str = "outputs/MA_TransA3C_soc_calibrated",
     algo: str = "MA-TransA3C",
 ):
     """Evaluate MA-TransA3C deterministically."""
+    if use_pressure_obs and not use_ma_station_obs:
+        raise ValueError("use_pressure_obs requires use_ma_station_obs=True.")
     env = create_charging_env(env_config)
     station_ids = [
         aid for aid, agent in env.registered_agents.items()
@@ -1373,6 +1589,7 @@ def evaluate_ma_transa3c(
         obs, info = env.reset(seed=seed + episode)
         episode_reward = {sid: 0.0 for sid in station_ids}
         prev_station_metrics: Dict[str, Dict[str, Any]] = {}
+        arrival_ema, prev_queue_len, prev_prev_queue_len = _init_pressure_obs_state(station_ids)
 
         for step in range(steps_per_episode):
             raw_obs_vecs = {}
@@ -1381,7 +1598,17 @@ def evaluate_ma_transa3c(
                 raw_obs_vecs[sid] = policy.extract_obs_vector(observation, 8)
 
             obs_vecs = (
-                build_ma_station_obs_matrix(station_ids, raw_obs_vecs, prev_station_metrics, env_config)
+                build_ma_station_obs_matrix(
+                    station_ids,
+                    raw_obs_vecs,
+                    prev_station_metrics,
+                    env_config,
+                    neighbor_index=neighbor_index,
+                    use_pressure_obs=use_pressure_obs,
+                    arrival_ema=arrival_ema,
+                    prev_queue_len=prev_queue_len,
+                    prev_prev_queue_len=prev_prev_queue_len,
+                )
                 if use_ma_station_obs
                 else raw_obs_vecs
             )
@@ -1399,6 +1626,15 @@ def evaluate_ma_transa3c(
 
             obs, rewards, terminated, truncated, infos = env.step(actions)
             station_metrics = infos.get("__all__", {}).get("station_metrics", {})
+            if use_pressure_obs:
+                _update_pressure_obs_state(
+                    station_ids,
+                    station_metrics,
+                    arrival_ema,
+                    prev_queue_len,
+                    prev_prev_queue_len,
+                    pressure_ema_alpha,
+                )
             prev_station_metrics = station_metrics
 
             for sid in station_ids:
